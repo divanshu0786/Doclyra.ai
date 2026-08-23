@@ -1,7 +1,9 @@
 import json
 import os
 from urllib import request, error
+from dotenv import load_dotenv
 
+load_dotenv()
 
 NOTION_API_URL = "https://api.notion.com/v1"
 NOTION_VERSION = "2026-03-11"
@@ -170,4 +172,113 @@ def query_data_source(
         "POST",
         f"/data_sources/{data_source_id}/query",
         body,
+    )
+def create_review_queue_item(
+    database_id: str,
+    document_name: str,
+    review_notes: str,
+    stop_reason: str,
+):
+    return create_page(
+        database_id,
+        {
+            "Document to Review": {
+                "title": [
+                    {
+                        "text": {
+                            "content": document_name
+                        }
+                    }
+                ]
+            },
+            "Review Notes": {
+                "rich_text": [
+                    {
+                        "text": {
+                            "content": review_notes
+                        }
+                    }
+                ]
+            },
+            "Stop Reason": {
+                "rich_text": [
+                    {
+                        "text": {
+                            "content": stop_reason
+                        }
+                    }
+                ]
+            },
+        },
+    )
+
+
+def create_onboarding_item(
+    database_id: str,
+    onboarding_id: int,
+    tenant_name: str,
+    status: str,
+):
+    return create_page(
+        database_id,
+        {
+            "Onboarding ID": {
+                "number": onboarding_id
+            },
+            "Tenant Name": {
+                "title": [
+                    {
+                        "text": {
+                            "content": tenant_name
+                        }
+                    }
+                ]
+            },
+            "Onboarding Status": {
+                "select": {
+                    "name": status
+                }
+            },
+        },
+    )
+
+
+def create_run_log_item(
+    database_id: str,
+    event_type: str,
+    status: str,
+    message: str,
+    onboarding_id: int | None = None,
+):
+    return create_page(
+        database_id,
+        {
+            "Run ID / Event": {
+                "title": [
+                    {
+                        "text": {
+                            "content": event_type
+                        }
+                    }
+                ]
+            },
+            "Outcome": {
+                "rich_text": [
+                    {
+                        "text": {
+                            "content": status
+                        }
+                    }
+                ]
+            },
+            "Code Action": {
+                "rich_text": [
+                    {
+                        "text": {
+                            "content": message
+                        }
+                    }
+                ]
+            },
+        },
     )
