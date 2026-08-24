@@ -7,3 +7,5 @@ pymupdf
 google-genai
 python-dotenv
 reportlab
+twilio
+requests

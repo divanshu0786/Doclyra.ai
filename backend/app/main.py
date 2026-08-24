@@ -1,9 +1,11 @@
+import asyncio
 import os
 import shutil
 import time
+from typing import Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, File, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 load_dotenv()
@@ -22,13 +24,17 @@ from .run_log import create_run_log
 from .rent_agreement_generator import generate_rent_agreement
 from .notion_service import (
     get_database,
+    get_page,
     create_onboarding_item,
     get_onboarding_by_id,
     create_document_item,
     get_document_by_id,
+    get_documents_by_onboarding,
     update_document_status,
     create_review_queue_item,
     query_database,
+    get_pending_agreement_requests,
+    mark_agreement_as_generated,
 )
 from .models import (
     DocumentType,
@@ -68,6 +74,161 @@ app = FastAPI(
 
 
 # =========================================================
+# HELPER: CONSTRUCT RENT AGREEMENT DATA
+# =========================================================
+
+def build_agreement_data_for_onboarding(onboarding_page: dict) -> dict:
+    props = onboarding_page.get("properties", {})
+    tenant_name_list = props.get("Tenant Name", {}).get("rich_text", [{}])
+    tenant_name = tenant_name_list[0].get("plain_text", "Tenant") if tenant_name_list else "Tenant"
+
+    prop_select = props.get("Property/PG", {}).get("select", {})
+    property_name = prop_select.get("name", "Flat - 101") if prop_select else "Flat - 101"
+
+    onb_id_list = props.get("Onboarding ID", {}).get("title", [{}])
+    onb_title = onb_id_list[0].get("plain_text", "ONB-1") if onb_id_list else "ONB-1"
+
+    # Fetch linked documents to get Aadhaar & PAN details if available
+    notion_documents_id = os.getenv("NOTION_DOCUMENTS_ID")
+    aadhaar_num = "____________"
+    pan_num = "____________"
+
+    if notion_documents_id and onboarding_page.get("id"):
+        try:
+            doc_pages = get_documents_by_onboarding(notion_documents_id, onboarding_page.get("id"))
+            for doc in doc_pages:
+                d_props = doc.get("properties", {})
+                d_type = d_props.get("Document Type", {}).get("select", {}).get("name", "")
+                d_num_list = d_props.get("Extracted Number", {}).get("rich_text", [{}])
+                d_num = d_num_list[0].get("plain_text", "") if d_num_list else ""
+                if d_type in ["AADHAR", "AADHAAR"] and d_num:
+                    aadhaar_num = d_num
+                elif d_type == "PAN" and d_num:
+                    pan_num = d_num
+        except Exception as e:
+            print(f"Error fetching documents for agreement: {e}")
+
+    return {
+        "landlord_name": "Property Owner / Landlord",
+        "landlord_address": f"{property_name}, Sunrise Residency, Chandigarh",
+        "landlord_contact": "+91 9876543210",
+        "tenant_name": f"{tenant_name} (Aadhaar: {aadhaar_num}, PAN: {pan_num})",
+        "tenant_address": f"Resident at {property_name}",
+        "tenant_contact": "+91 9996570779",
+        "property_address": f"{property_name}, Sunrise Residency, Sector 22, Chandigarh",
+        "property_type": "Apartment",
+        "property_floor_unit": property_name,
+        "start_date": "01-09-2026",
+        "end_date": "31-07-2027",
+        "lease_duration": "11 months",
+        "rent_amount": "15,000",
+        "rent_in_words": "Fifteen Thousand Rupees Only",
+        "rent_due_day": "5th",
+        "payment_method": "BANK_TRANSFER",
+        "late_fee": "100",
+        "security_deposit": "30,000",
+        "deposit_refund_days": "30",
+        "signature_date": "24-08-2026",
+    }
+
+
+# =========================================================
+# NOTION CHECKBOX POLLER FUNCTION
+# =========================================================
+
+def poll_and_process_rent_agreements() -> dict:
+    notion_agreements_id = os.getenv("NOTION_RENT_AGREEMENTS_ID")
+    notion_onboarding_id = os.getenv("NOTION_ONBOARDING_ID")
+
+    if not notion_agreements_id:
+        return {"processed": 0, "message": "NOTION_RENT_AGREEMENTS_ID not configured"}
+
+    pending_requests = get_pending_agreement_requests(notion_agreements_id)
+    processed_count = 0
+
+    for row in pending_requests:
+        row_id = row.get("id")
+        props = row.get("properties", {})
+        target_relations = props.get("Target Onboarding", {}).get("relation", [])
+
+        onb_page = None
+        if target_relations:
+            onb_page_id = target_relations[0].get("id")
+            try:
+                onb_page = get_page(onb_page_id)
+            except Exception as e:
+                print(f"Error fetching target onboarding {onb_page_id}: {e}")
+
+        # Fallback if no target relation linked: fetch most recent onboarding
+        if not onb_page and notion_onboarding_id:
+            try:
+                all_onb = query_database(notion_onboarding_id).get("results", [])
+                if all_onb:
+                    onb_page = all_onb[0]
+            except Exception:
+                pass
+
+        if onb_page:
+            agreement_data = build_agreement_data_for_onboarding(onb_page)
+        else:
+            agreement_data = {
+                "tenant_name": "Tenant",
+                "property_address": "Assigned Unit",
+                "rent_amount": "15,000",
+                "security_deposit": "30,000",
+                "start_date": "01-09-2026",
+                "end_date": "31-07-2027",
+            }
+
+        # 1. Generate PDF
+        pdf_buffer = generate_rent_agreement(agreement_data)
+        os.makedirs("uploads/agreements", exist_ok=True)
+        pdf_filename = f"agreement_{row_id}.pdf"
+        pdf_path = os.path.join("uploads", "agreements", pdf_filename)
+        with open(pdf_path, "wb") as f:
+            f.write(pdf_buffer.getvalue())
+
+        # 2. Reset '[ ] Generate Now' checkbox back to False in Notion
+        try:
+            mark_agreement_as_generated(row_id)
+        except Exception as e:
+            print(f"Error resetting checkbox in Notion: {e}")
+
+        # 3. Log to Notion RUN LOG
+        onb_title = onb_page.get("properties", {}).get("Onboarding ID", {}).get("title", [{}])[0].get("plain_text", "1") if onb_page else "1"
+        clean_num = onb_title.replace("ONB-", "")
+
+        create_run_log(
+            event_type="RENT_AGREEMENT_GENERATED",
+            status="SUCCESS",
+            message=f"Rent Agreement generated for {agreement_data.get('tenant_name')}",
+            onboarding_id=clean_num,
+        )
+
+        processed_count += 1
+
+    return {"processed": processed_count, "status": "ok"}
+
+
+# =========================================================
+# STARTUP BACKGROUND POLLING LOOP
+# =========================================================
+
+@app.on_event("startup")
+async def start_background_workers():
+    async def agreement_polling_loop():
+        # Polling loop: checks every 10 seconds for checked boxes in Notion
+        while True:
+            try:
+                poll_and_process_rent_agreements()
+            except Exception as e:
+                pass
+            await asyncio.sleep(10)
+
+    asyncio.create_task(agreement_polling_loop())
+
+
+# =========================================================
 # HEALTH
 # =========================================================
 
@@ -92,6 +253,7 @@ def notion_test():
         "onboarding": os.getenv("NOTION_ONBOARDING_ID"),
         "run_log": os.getenv("NOTION_RUN_LOG_ID"),
         "documents": os.getenv("NOTION_DOCUMENTS_ID"),
+        "rent_agreements": os.getenv("NOTION_RENT_AGREEMENTS_ID"),
     }
 
     results = {}
@@ -343,29 +505,37 @@ def upload_document(
         document_id=doc_num_id,
     )
 
-    # 7. Validate Document
+    # 7. Fetch tenant registered name for mismatch checking
+    notion_documents_id = os.getenv("NOTION_DOCUMENTS_ID")
+    notion_onboarding_id = os.getenv("NOTION_ONBOARDING_ID")
+    onb_page = get_onboarding_by_id(notion_onboarding_id, onboarding_id) if notion_onboarding_id else None
+    expected_tenant_name = None
+    if onb_page:
+        tenant_name_prop = onb_page.get("properties", {}).get("Tenant Name", {}).get("rich_text", [{}])
+        expected_tenant_name = tenant_name_prop[0].get("plain_text", "") if tenant_name_prop else None
+
+    # Validate Document
     validation = None
     if classified_type == "PAN":
-        validation = validate_pan(extracted_data)
+        validation = validate_pan(extracted_data, expected_name=expected_tenant_name)
     elif classified_type == "AADHAAR":
-        validation = validate_aadhaar(extracted_data)
+        validation = validate_aadhaar(extracted_data, expected_name=expected_tenant_name)
     elif classified_type == "RENT_AGREEMENT":
-        validation = validate_rent_agreement(extracted_data)
+        validation = validate_rent_agreement(extracted_data, expected_name=expected_tenant_name)
 
     is_valid = validation.get("valid", False) if validation else False
     final_status = "APPROVED" if is_valid else "MANUAL_REVIEW"
+    validation_err = validation.get("error") if validation and isinstance(validation, dict) else "Requires manual review"
 
     create_run_log(
         event_type="DOCUMENT_VALIDATED",
         status="VALID" if is_valid else "MANUAL_REVIEW",
-        message="Validation succeeded" if is_valid else "Requires manual review",
+        message="Validation succeeded" if is_valid else f"Validation stopped: {validation_err}",
         onboarding_id=onboarding_id,
         document_id=doc_num_id,
     )
 
     # 8. Sync Document directly to Notion DOCUMENTS database
-    notion_documents_id = os.getenv("NOTION_DOCUMENTS_ID")
-    notion_onboarding_id = os.getenv("NOTION_ONBOARDING_ID")
     doc_page = None
 
     if notion_documents_id:
@@ -376,8 +546,6 @@ def upload_document(
                 extracted_name = extracted_data.get("name") or extracted_data.get("tenant_name")
                 extracted_num = extracted_data.get("pan_number") or extracted_data.get("aadhaar_number")
 
-            # Link to onboarding page if found
-            onb_page = get_onboarding_by_id(notion_onboarding_id, onboarding_id) if notion_onboarding_id else None
             onb_page_id = onb_page.get("id") if onb_page else None
 
             doc_page = create_document_item(
@@ -497,11 +665,50 @@ def resend_document(
 
 
 # =========================================================
-# RENT AGREEMENT GENERATION
+# RENT AGREEMENT GENERATION & POLLING ENDPOINTS
 # =========================================================
 
+@app.post("/notion/poll-agreements")
+def poll_agreements_now():
+    """
+    Manually triggers a scan of the RENT AGREEMENTS database for checked rows.
+    """
+    result = poll_and_process_rent_agreements()
+    return result
+
+
+@app.get("/onboardings/{onboarding_id}/rent-agreement")
+def download_rent_agreement(onboarding_id: str):
+    """
+    Dynamically generates and downloads the Rent Agreement PDF for a given onboarding.
+    """
+    notion_onboarding_id = os.getenv("NOTION_ONBOARDING_ID")
+    onb_page = get_onboarding_by_id(notion_onboarding_id, onboarding_id) if notion_onboarding_id else None
+
+    if onb_page:
+        agreement_data = build_agreement_data_for_onboarding(onb_page)
+    else:
+        agreement_data = {
+            "tenant_name": f"Tenant #{onboarding_id}",
+            "property_address": "Assigned Unit",
+            "rent_amount": "15,000",
+            "security_deposit": "30,000",
+            "start_date": "01-09-2026",
+            "end_date": "31-07-2027",
+        }
+
+    pdf_buffer = generate_rent_agreement(agreement_data)
+    return StreamingResponse(
+        pdf_buffer,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="rent_agreement_onb_{onboarding_id}.pdf"'
+        },
+    )
+
+
 @app.post("/rent-agreements")
-def create_rent_agreement(data: dict):
+def create_rent_agreement_custom(data: dict):
     try:
         pdf_file = generate_rent_agreement(data)
         return StreamingResponse(

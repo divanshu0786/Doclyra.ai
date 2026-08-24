@@ -61,6 +61,10 @@ def get_database(database_id: str) -> dict:
     return _request("GET", f"/databases/{database_id}")
 
 
+def get_page(page_id: str) -> dict:
+    return _request("GET", f"/pages/{page_id}")
+
+
 def query_database(
     database_id: str,
     filter_body: dict | None = None,
@@ -385,6 +389,40 @@ def create_review_queue_item(
         }
 
     return create_page(database_id, props)
+
+
+# =========================================================
+# RENT AGREEMENTS DATABASE POLLING
+# =========================================================
+
+def get_pending_agreement_requests(database_id: str) -> list:
+    """
+    Query the RENT AGREEMENTS database for any rows where '[ ] Generate Now' checkbox is True.
+    """
+    res = query_database(
+        database_id,
+        filter_body={
+            "property": "[ ] Generate Now",
+            "checkbox": {
+                "equals": True
+            }
+        }
+    )
+    return res.get("results", [])
+
+
+def mark_agreement_as_generated(page_id: str) -> dict:
+    """
+    Reset '[ ] Generate Now' checkbox back to False once processed.
+    """
+    return update_page(
+        page_id,
+        {
+            "[ ] Generate Now": {
+                "checkbox": False
+            }
+        }
+    )
 
 
 # =========================================================

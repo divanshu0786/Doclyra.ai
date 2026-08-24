@@ -8,6 +8,7 @@ DATABASES = {
     "ONBOARDINGS": os.getenv("NOTION_ONBOARDING_ID"),
     "DOCUMENTS": os.getenv("NOTION_DOCUMENTS_ID"),
     "REVIEW_QUEUE": os.getenv("NOTION_REVIEW_QUEUE_ID"),
+    "RENT_AGREEMENTS": os.getenv("NOTION_RENT_AGREEMENTS_ID"),
     "RUN_LOG": os.getenv("NOTION_RUN_LOG_ID"),
 }
 
@@ -63,7 +64,18 @@ def main():
             rows.append({"Task": task, "Decision": decision, "Stop Reason": reason[:40]})
         print_table("REVIEW QUEUE", rows)
 
-    # 4. Run Log
+    # 4. Rent Agreements
+    if DATABASES["RENT_AGREEMENTS"]:
+        res = query_database(DATABASES["RENT_AGREEMENTS"])
+        rows = []
+        for p in res.get("results", []):
+            props = p.get("properties", {})
+            name = props.get("Name", {}).get("title", [{}])[0].get("plain_text", "") if props.get("Name", {}).get("title") else "Agreement"
+            generate_now = props.get("[ ] Generate Now", {}).get("checkbox", False)
+            rows.append({"Name": name, "Generate Now Checkbox": generate_now})
+        print_table("RENT AGREEMENTS", rows)
+
+    # 5. Run Log
     if DATABASES["RUN_LOG"]:
         res = query_database(DATABASES["RUN_LOG"])
         rows = []

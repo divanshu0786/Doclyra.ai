@@ -9,6 +9,10 @@ class Settings(BaseSettings):
     notion_onboarding_id: str
     notion_run_log_id: str
     notion_documents_id: str
+    notion_rent_agreements_id: str | None = None
+    twilio_account_sid: str | None = None
+    twilio_auth_token: str | None = None
+    twilio_whatsapp_number: str | None = None
     database_url: str | None = None
 
     class Config:
