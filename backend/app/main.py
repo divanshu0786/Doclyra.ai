@@ -1,22 +1,13 @@
 import os
 import shutil
-
+import time
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, File, UploadFile
+from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy import text
-from sqlalchemy.orm import Session
+from pydantic import BaseModel
 
-from .database import Base, engine, get_db
-from .models import (
-    Document,
-    Onboarding,
-    Property,
-    Tenant,
-    RunLog,
-    ReviewDecision,
-)
 load_dotenv()
+
 from .document_inspector import inspect_document
 from .document_classifier import classify_document
 from .document_extractor import extract_document_data
@@ -29,20 +20,50 @@ from .onboarding_service import get_onboarding_checklist
 from .onboarding_status import evaluate_onboarding_status
 from .run_log import create_run_log
 from .rent_agreement_generator import generate_rent_agreement
-from pydantic import BaseModel
 from .notion_service import (
     get_database,
-    get_data_source,
+    create_onboarding_item,
+    get_onboarding_by_id,
+    create_document_item,
+    get_document_by_id,
+    update_document_status,
+    create_review_queue_item,
+    query_database,
 )
+from .models import (
+    DocumentType,
+    DocumentStatus,
+    OnboardingStatus,
+    ReviewDecision,
+)
+
 
 class ReviewRequest(BaseModel):
     decision: str
     reason: str | None = None
 
 
+class PropertyCreate(BaseModel):
+    name: str
+    address: str
+
+
+class TenantCreate(BaseModel):
+    property_name: str | None = None
+    name: str
+    phone: str
+    unit_number: str
+
+
+class OnboardingCreate(BaseModel):
+    tenant_name: str
+    onboarding_id: str | int | None = None
+    property_name: str | None = None
+
+
 app = FastAPI(
-    title="Tenant Document Automation",
-    version="0.1.0",
+    title="Tenant Document Automation (Notion-Powered)",
+    version="1.0.0",
 )
 
 
@@ -51,678 +72,352 @@ app = FastAPI(
 # =========================================================
 
 @app.get("/health")
-def health(
-    db: Session = Depends(get_db),
-):
-    try:
-        db.execute(text("SELECT 1"))
+def health():
+    token = os.getenv("NOTION_ACCESS_TOKEN")
+    return {
+        "status": "ok",
+        "storage": "notion",
+        "notion_configured": bool(token),
+    }
 
-        return {
-            "status": "ok",
-            "database": "connected",
-        }
 
-    except Exception as e:
-        return {
-            "status": "error",
-            "database": "unavailable",
-            "detail": str(e),
-        }
 # =========================================================
 # NOTION CONNECTION TEST
 # =========================================================
 
 @app.get("/notion/test")
 def notion_test():
-
     databases = {
-        "review_queue": os.getenv(
-            "NOTION_REVIEW_QUEUE_ID"
-        ),
-        "onboarding": os.getenv(
-            "NOTION_ONBOARDING_ID"
-        ),
-        "run_log": os.getenv(
-            "NOTION_RUN_LOG_ID"
-        ),
+        "review_queue": os.getenv("NOTION_REVIEW_QUEUE_ID"),
+        "onboarding": os.getenv("NOTION_ONBOARDING_ID"),
+        "run_log": os.getenv("NOTION_RUN_LOG_ID"),
+        "documents": os.getenv("NOTION_DOCUMENTS_ID"),
     }
 
     results = {}
-
     for name, database_id in databases.items():
-
         if not database_id:
-
             results[name] = {
                 "status": "ERROR",
-                "message": "Database ID is missing.",
+                "message": "Database ID is missing in .env.",
             }
-
             continue
 
         try:
-
-            database = get_database(
-                database_id
-            )
-
-            data_source = get_data_source(
-                database_id
-            )
-
+            database = get_database(database_id)
+            title_prop = database.get("title", [{}])
+            db_title = title_prop[0].get("plain_text", "") if title_prop else ""
             results[name] = {
                 "status": "CONNECTED",
                 "database_id": database_id,
-                "database_name": database.get(
-                    "title",
-                    [{}],
-                )[0].get(
-                    "plain_text",
-                    "",
-                ) if database.get("title") else "",
-                "data_source_id": data_source.get(
-                    "id"
-                ),
-                "properties": list(
-                    data_source.get(
-                        "properties",
-                        {}
-                    ).keys()
-                ),
+                "database_name": db_title,
+                "properties": list(database.get("properties", {}).keys()),
             }
-
         except Exception as e:
-
             results[name] = {
                 "status": "ERROR",
                 "message": str(e),
             }
 
     return results
-# =========================================================
-# DATABASE SETUP
-# =========================================================
-
-@app.post("/setup")
-def setup_database():
-    Base.metadata.create_all(
-        bind=engine
-    )
-
-    return {
-        "status": "ok",
-        "message": "Database tables created",
-    }
 
 
 # =========================================================
-# PROPERTIES
+# PROPERTIES & TENANTS (Helper Endpoints)
 # =========================================================
 
 @app.post("/properties")
-def create_property(
-    name: str,
-    address: str,
-    db: Session = Depends(get_db),
-):
-    property_item = Property(
-        name=name,
-        address=address,
-    )
-
-    db.add(property_item)
-    db.commit()
-    db.refresh(property_item)
-
+def create_property(name: str, address: str):
     return {
-        "id": property_item.id,
-        "name": property_item.name,
-        "address": property_item.address,
+        "name": name,
+        "address": address,
+        "status": "active",
     }
 
-
-# =========================================================
-# TENANTS
-# =========================================================
 
 @app.post("/tenants")
 def create_tenant(
-    property_id: int,
     name: str,
     phone: str,
     unit_number: str,
-    db: Session = Depends(get_db),
+    property_name: str | None = None,
 ):
-    property_item = db.get(
-        Property,
-        property_id,
-    )
-
-    if not property_item:
-        raise HTTPException(
-            status_code=404,
-            detail="Property not found",
-        )
-
-    tenant = Tenant(
-        property_id=property_id,
-        name=name,
-        phone=phone,
-        unit_number=unit_number,
-    )
-
-    db.add(tenant)
-    db.commit()
-    db.refresh(tenant)
-
     return {
-        "id": tenant.id,
-        "property_id": tenant.property_id,
-        "name": tenant.name,
-        "phone": tenant.phone,
-        "unit_number": tenant.unit_number,
+        "name": name,
+        "phone": phone,
+        "unit_number": unit_number,
+        "property_name": property_name or "Flat - 101",
     }
 
 
 # =========================================================
-# ONBOARDING
+# ONBOARDINGS
 # =========================================================
 
 @app.post("/onboardings")
 def create_onboarding(
-    tenant_id: int,
-    db: Session = Depends(get_db),
+    tenant_name: str,
+    property_name: str | None = None,
+    onboarding_id: int | str | None = None,
 ):
-    tenant = db.get(
-        Tenant,
-        tenant_id,
-    )
-
-    if not tenant:
+    notion_onboarding_id = os.getenv("NOTION_ONBOARDING_ID")
+    if not notion_onboarding_id:
         raise HTTPException(
-            status_code=404,
-            detail="Tenant not found",
+            status_code=500,
+            detail="NOTION_ONBOARDING_ID is not configured in .env",
         )
 
-    onboarding = Onboarding(
-        tenant_id=tenant_id,
+    # Generate sequential or timestamped ID if not provided
+    chosen_id = onboarding_id or int(time.time()) % 100000
+
+    try:
+        page = create_onboarding_item(
+            database_id=notion_onboarding_id,
+            onboarding_id=chosen_id,
+            tenant_name=tenant_name,
+            status="In Progress",
+            property_name=property_name,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create Onboarding in Notion: {e}",
+        )
+
+    # Record in Notion RUN LOG
+    create_run_log(
+        event_type="ONBOARDING_CREATED",
+        status="SUCCESS",
+        message=f"Onboarding #{chosen_id} created for {tenant_name}",
+        onboarding_id=chosen_id,
     )
 
-    db.add(onboarding)
-    db.commit()
-    db.refresh(onboarding)
-
     return {
-        "id": onboarding.id,
-        "tenant_id": onboarding.tenant_id,
-        "status": onboarding.status,
-        "created_at": onboarding.created_at,
+        "onboarding_id": chosen_id,
+        "tenant_name": tenant_name,
+        "status": "IN_PROGRESS",
+        "notion_page_id": page.get("id"),
     }
 
 
-# =========================================================
-# ONBOARDING CHECKLIST
-# =========================================================
-
 @app.get("/onboardings/{onboarding_id}/checklist")
-def onboarding_checklist(
-    onboarding_id: int,
-    db: Session = Depends(get_db),
-):
-    onboarding = db.get(
-        Onboarding,
-        onboarding_id,
-    )
+def onboarding_checklist(onboarding_id: str):
+    return get_onboarding_checklist(onboarding_id)
 
-    if not onboarding:
-        raise HTTPException(
-            status_code=404,
-            detail="Onboarding not found",
-        )
-
-    return get_onboarding_checklist(
-        db,
-        onboarding_id,
-    )
-
-
-# =========================================================
-# ONBOARDING STATUS
-# =========================================================
 
 @app.get("/onboardings/{onboarding_id}/status")
-def onboarding_status(
-    onboarding_id: int,
-    db: Session = Depends(get_db),
-):
-    onboarding = db.get(
-        Onboarding,
-        onboarding_id,
-    )
-
-    if not onboarding:
-        raise HTTPException(
-            status_code=404,
-            detail="Onboarding not found",
-        )
-
-    return evaluate_onboarding_status(
-        db,
-        onboarding_id,
-    )
+def onboarding_status(onboarding_id: str):
+    return evaluate_onboarding_status(onboarding_id)
 
 
 # =========================================================
-# DOCUMENT UPLOAD
+# DOCUMENT UPLOAD & EXTRACTION PIPELINE
 # =========================================================
 
 @app.post("/documents/upload")
 def upload_document(
-    onboarding_id: int,
+    onboarding_id: str,
     file: UploadFile = File(...),
-    db: Session = Depends(get_db),
 ):
-    # =====================================================
-    # 1. CHECK ONBOARDING
-    # =====================================================
-
-    onboarding = db.get(
-        Onboarding,
-        onboarding_id,
-    )
-
-    if not onboarding:
-        raise HTTPException(
-            status_code=404,
-            detail="Onboarding not found",
-        )
-
-    # =====================================================
-    # 2. CHECK FILE TYPE
-    # =====================================================
-
+    # 1. Verify Allowed Types
     allowed_types = {
         "application/pdf",
         "image/jpeg",
         "image/png",
     }
-
-    if file.content_type not in allowed_types:
+    content_type_str = file.content_type or "application/octet-stream"
+    if content_type_str not in allowed_types:
         raise HTTPException(
             status_code=400,
             detail="Only PDF, JPG, and PNG files are allowed",
         )
 
-    # =====================================================
-    # 3. CREATE UPLOAD DIRECTORY
-    # =====================================================
-
+    # 2. Store Local Temp File
     upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    filename = os.path.basename(file.filename or "document")
+    doc_num_id = int(time.time() * 1000) % 1000000
+    storage_path = os.path.join(upload_dir, f"onb_{onboarding_id}_{doc_num_id}_{filename}")
 
-    os.makedirs(
-        upload_dir,
-        exist_ok=True,
-    )
+    with open(storage_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
 
-    # =====================================================
-    # 4. MAKE FILENAME SAFE
-    # =====================================================
-
-    filename = os.path.basename(
-        file.filename or "document"
-    )
-
-    # =====================================================
-    # 5. SAVE FILE
-    # =====================================================
-
-    storage_path = os.path.join(
-        upload_dir,
-        f"onboarding_{onboarding_id}_{filename}",
-    )
-
-    with open(
-        storage_path,
-        "wb",
-    ) as buffer:
-        shutil.copyfileobj(
-            file.file,
-            buffer,
-        )
-
-    # =====================================================
-    # 6. CREATE DOCUMENT DATABASE RECORD
-    # =====================================================
-
-    document = Document(
-        onboarding_id=onboarding_id,
-        filename=filename,
-        mime_type=file.content_type,
-        source="WEB_UPLOAD",
-        storage_path=storage_path,
-        document_type="UNKNOWN",
-        status="RECEIVED",
-        extracted_data={},
-    )
-
-    db.add(document)
-    db.flush()
-
-    # =====================================================
-    # RUN LOG: DOCUMENT RECEIVED
-    # =====================================================
-
+    # 3. Log Document Received in Notion RUN LOG
     create_run_log(
-        db=db,
         event_type="DOCUMENT_RECEIVED",
         status="RECEIVED",
-        message=f"Document {filename} received for processing.",
+        message=f"File {filename} received for Onboarding #{onboarding_id}",
         onboarding_id=onboarding_id,
-        document_id=document.id,
+        document_id=doc_num_id,
     )
 
-    # =====================================================
-    # 7. INSPECT DOCUMENT QUALITY
-    # =====================================================
+    # 4. Inspect Document Quality
+    inspection = inspect_document(storage_path, content_type_str)
+    quality_status = inspection.get("quality", "GOOD")
+    quality_reason = str(inspection.get("quality_reason", ""))
 
-    inspection = inspect_document(
-        storage_path,
-        file.content_type,
+    create_run_log(
+        event_type="QUALITY_CHECK",
+        status="GOOD" if quality_status == "GOOD" else "QUALITY_FAILED",
+        message=quality_reason,
+        onboarding_id=onboarding_id,
+        document_id=doc_num_id,
     )
 
-    document.quality_score = inspection[
-        "quality_score"
-    ]
-
-    document.quality_reason = inspection[
-        "quality_reason"
-    ]
-
-    # =====================================================
-    # RUN LOG: QUALITY CHECK
-    # =====================================================
-
-    if inspection["quality"] == "GOOD":
-
-        create_run_log(
-            db=db,
-            event_type="QUALITY_CHECK",
-            status="GOOD",
-            message=inspection["quality_reason"],
-            onboarding_id=onboarding_id,
-            document_id=document.id,
-        )
-
-    else:
-
-        create_run_log(
-            db=db,
-            event_type="QUALITY_CHECK",
-            status="QUALITY_FAILED",
-            message=inspection["quality_reason"],
-            onboarding_id=onboarding_id,
-            document_id=document.id,
-        )
-
-    # =====================================================
-    # 8. STOP IF QUALITY IS BAD
-    # =====================================================
-
-    if inspection["quality"] != "GOOD":
-
-        document.document_type = "UNKNOWN"
-        document.status = "QUALITY_FAILED"
-        document.extracted_data = {}
-
-        db.commit()
-        db.refresh(document)
-
-        checklist = get_onboarding_checklist(
-            db,
-            onboarding_id,
-        )
+    if quality_status != "GOOD":
+        # Create Error / Manual Review in Notion REVIEW QUEUE
+        notion_review_id = os.getenv("NOTION_REVIEW_QUEUE_ID")
+        if notion_review_id:
+            try:
+                create_review_queue_item(
+                    database_id=notion_review_id,
+                    task_title=f"Quality Failed - Doc #{doc_num_id}",
+                    review_notes=f"File: {filename}",
+                    stop_reason=quality_reason or "Image quality rejected",
+                )
+            except Exception as e:
+                print(f"Notion REVIEW QUEUE sync failed: {e}")
 
         return {
-            "id": document.id,
-            "onboarding_id": document.onboarding_id,
-            "filename": document.filename,
-            "mime_type": document.mime_type,
-            "document_type": document.document_type,
-            "status": document.status,
+            "document_id": doc_num_id,
+            "onboarding_id": onboarding_id,
+            "filename": filename,
+            "document_type": "UNKNOWN",
+            "status": "QUALITY_FAILED",
             "extracted_data": {},
-            "validation": None,
             "inspection": inspection,
-            "checklist": checklist,
+            "validation": None,
         }
 
-    # =====================================================
-    # 9. CLASSIFY DOCUMENT WITH GEMINI
-    # =====================================================
-
+    # 5. Classify Document with Gemini
     try:
-
-        document_type = classify_document(
-            storage_path,
-            file.content_type,
-        )
-
+        classified_type = classify_document(storage_path, content_type_str)
     except RuntimeError as e:
-
-        document.status = "PROCESSING_ERROR"
-        document.document_type = "UNKNOWN"
-        document.extracted_data = {}
-
         create_run_log(
-            db=db,
             event_type="CLASSIFICATION_FAILED",
             status="PROCESSING_ERROR",
             message=str(e),
             onboarding_id=onboarding_id,
-            document_id=document.id,
+            document_id=doc_num_id,
         )
-
-        db.commit()
-        db.refresh(document)
-
         return {
-            "id": document.id,
-            "onboarding_id": document.onboarding_id,
-            "filename": document.filename,
-            "mime_type": document.mime_type,
+            "document_id": doc_num_id,
+            "onboarding_id": onboarding_id,
+            "filename": filename,
             "document_type": "UNKNOWN",
             "status": "PROCESSING_ERROR",
-            "extracted_data": {},
-            "validation": None,
-            "inspection": inspection,
             "error": str(e),
         }
 
-    document.document_type = document_type
-
-    # =====================================================
-    # RUN LOG: DOCUMENT CLASSIFIED
-    # =====================================================
-
     create_run_log(
-        db=db,
         event_type="DOCUMENT_CLASSIFIED",
         status="CLASSIFIED",
-        message=f"Document classified as {document_type}.",
+        message=f"Document classified as {classified_type}.",
         onboarding_id=onboarding_id,
-        document_id=document.id,
+        document_id=doc_num_id,
     )
 
-    # =====================================================
-    # 10. EXTRACT DOCUMENT DATA
-    # =====================================================
-
+    # 6. Extract Document Data
     extracted_data = {}
-
-    if document_type in {
-        "PAN",
-        "AADHAAR",
-        "RENT_AGREEMENT",
-    }:
-
+    if classified_type in {"PAN", "AADHAAR", "RENT_AGREEMENT"}:
         try:
-
             extracted_data = extract_document_data(
                 storage_path,
-                file.content_type,
-                document_type,
+                content_type_str,
+                classified_type,
             )
-
         except RuntimeError as e:
-
-            document.status = "PROCESSING_ERROR"
-            document.extracted_data = {}
-
             create_run_log(
-                db=db,
                 event_type="EXTRACTION_FAILED",
                 status="PROCESSING_ERROR",
                 message=str(e),
                 onboarding_id=onboarding_id,
-                document_id=document.id,
+                document_id=doc_num_id,
             )
 
-            db.commit()
-            db.refresh(document)
-
-            return {
-                "id": document.id,
-                "onboarding_id": document.onboarding_id,
-                "filename": document.filename,
-                "mime_type": document.mime_type,
-                "document_type": document.document_type,
-                "status": "PROCESSING_ERROR",
-                "extracted_data": {},
-                "validation": None,
-                "inspection": inspection,
-                "error": str(e),
-            }
-
-    document.extracted_data = extracted_data
-
-    # =====================================================
-    # RUN LOG: DATA EXTRACTED
-    # =====================================================
-
     create_run_log(
-        db=db,
         event_type="DATA_EXTRACTED",
         status="EXTRACTED",
-        message=f"Data extracted from {document_type} document.",
+        message=f"Data extracted for {classified_type}.",
         onboarding_id=onboarding_id,
-        document_id=document.id,
+        document_id=doc_num_id,
     )
 
-    # =====================================================
-    # 11. VALIDATE DOCUMENT
-    # =====================================================
-
+    # 7. Validate Document
     validation = None
+    if classified_type == "PAN":
+        validation = validate_pan(extracted_data)
+    elif classified_type == "AADHAAR":
+        validation = validate_aadhaar(extracted_data)
+    elif classified_type == "RENT_AGREEMENT":
+        validation = validate_rent_agreement(extracted_data)
 
-    # -----------------------------------------------------
-    # PAN
-    # -----------------------------------------------------
+    is_valid = validation.get("valid", False) if validation else False
+    final_status = "APPROVED" if is_valid else "MANUAL_REVIEW"
 
-    if document_type == "PAN":
-
-        validation = validate_pan(
-            extracted_data
-        )
-
-        if validation["valid"]:
-            document.status = "APPROVED"
-        else:
-            document.status = "MANUAL_REVIEW"
-
-    # -----------------------------------------------------
-    # AADHAAR
-    # -----------------------------------------------------
-
-    elif document_type == "AADHAAR":
-
-        validation = validate_aadhaar(
-            extracted_data
-        )
-
-        if validation["valid"]:
-            document.status = "APPROVED"
-        else:
-            document.status = "MANUAL_REVIEW"
-
-    # -----------------------------------------------------
-    # RENT AGREEMENT
-    # -----------------------------------------------------
-
-    elif document_type == "RENT_AGREEMENT":
-
-        validation = validate_rent_agreement(
-            extracted_data
-        )
-
-        if validation["valid"]:
-            document.status = "APPROVED"
-        else:
-            document.status = "MANUAL_REVIEW"
-
-    # -----------------------------------------------------
-    # UNKNOWN
-    # -----------------------------------------------------
-
-    else:
-
-        document.status = "MANUAL_REVIEW"
-
-    # =====================================================
-    # RUN LOG: DOCUMENT VALIDATED
-    # =====================================================
-
-    if validation:
-
-        create_run_log(
-            db=db,
-            event_type="DOCUMENT_VALIDATED",
-            status=validation["status"],
-            message=(
-                "Document validation passed."
-                if validation["valid"]
-                else "Document requires manual review."
-            ),
-            onboarding_id=onboarding_id,
-            document_id=document.id,
-        )
-
-    # =====================================================
-    # 12. SAVE DATABASE CHANGES
-    # =====================================================
-
-    db.commit()
-    db.refresh(document)
-
-    # =====================================================
-    # 13. GET ONBOARDING CHECKLIST
-    # =====================================================
-
-    checklist = get_onboarding_checklist(
-        db,
-        onboarding_id,
+    create_run_log(
+        event_type="DOCUMENT_VALIDATED",
+        status="VALID" if is_valid else "MANUAL_REVIEW",
+        message="Validation succeeded" if is_valid else "Requires manual review",
+        onboarding_id=onboarding_id,
+        document_id=doc_num_id,
     )
 
-    # =====================================================
-    # 14. RETURN COMPLETE RESULT
-    # =====================================================
+    # 8. Sync Document directly to Notion DOCUMENTS database
+    notion_documents_id = os.getenv("NOTION_DOCUMENTS_ID")
+    notion_onboarding_id = os.getenv("NOTION_ONBOARDING_ID")
+    doc_page = None
+
+    if notion_documents_id:
+        try:
+            extracted_name = None
+            extracted_num = None
+            if extracted_data:
+                extracted_name = extracted_data.get("name") or extracted_data.get("tenant_name")
+                extracted_num = extracted_data.get("pan_number") or extracted_data.get("aadhaar_number")
+
+            # Link to onboarding page if found
+            onb_page = get_onboarding_by_id(notion_onboarding_id, onboarding_id) if notion_onboarding_id else None
+            onb_page_id = onb_page.get("id") if onb_page else None
+
+            doc_page = create_document_item(
+                database_id=notion_documents_id,
+                document_id=doc_num_id,
+                doc_type=classified_type,
+                name=str(extracted_name) if extracted_name else None,
+                number=str(extracted_num) if extracted_num else None,
+                validation_status=final_status,
+                onboarding_page_id=onb_page_id,
+            )
+        except Exception as e:
+            print(f"Notion DOCUMENTS sync failed: {e}")
+
+    # 9. If Manual Review Required, push to Notion REVIEW QUEUE
+    if final_status == "MANUAL_REVIEW":
+        notion_review_id = os.getenv("NOTION_REVIEW_QUEUE_ID")
+        if notion_review_id:
+            try:
+                err_msg = validation.get("error") if validation and isinstance(validation, dict) else "Manual check required"
+                create_review_queue_item(
+                    database_id=notion_review_id,
+                    task_title=f"Review {classified_type} - Doc #{doc_num_id}",
+                    review_notes=f"Onboarding #{onboarding_id} | Extracted: {extracted_data}",
+                    stop_reason=str(err_msg),
+                    document_page_id=doc_page.get("id") if doc_page else None,
+                )
+            except Exception as e:
+                print(f"Notion REVIEW QUEUE sync failed: {e}")
+
+    # 10. Return Checklist & Results
+    checklist = get_onboarding_checklist(onboarding_id)
 
     return {
-        "id": document.id,
-        "onboarding_id": document.onboarding_id,
-        "filename": document.filename,
-        "mime_type": document.mime_type,
-        "document_type": document.document_type,
-        "status": document.status,
-        "extracted_data": document.extracted_data,
+        "document_id": doc_num_id,
+        "onboarding_id": onboarding_id,
+        "filename": filename,
+        "document_type": classified_type,
+        "status": final_status,
+        "extracted_data": extracted_data,
         "validation": validation,
         "inspection": inspection,
         "checklist": checklist,
@@ -730,319 +425,127 @@ def upload_document(
 
 
 # =========================================================
-# APPROVE DOCUMENT
+# APPROVE / RESEND (Human Decision in Notion)
 # =========================================================
 
 @app.post("/documents/{document_id}/approve")
 def approve_document(
-    document_id: int,
-    db: Session = Depends(get_db),
+    document_id: str,
+    request_data: ReviewRequest | None = None,
 ):
-    document = db.get(
-        Document,
-        document_id,
-    )
+    notion_documents_id = os.getenv("NOTION_DOCUMENTS_ID")
+    if not notion_documents_id:
+        raise HTTPException(status_code=500, detail="NOTION_DOCUMENTS_ID not configured")
 
-    if not document:
-        raise HTTPException(
-            status_code=404,
-            detail="Document not found",
-        )
+    doc_page = get_document_by_id(notion_documents_id, document_id)
+    if not doc_page:
+        raise HTTPException(status_code=404, detail=f"Document {document_id} not found in Notion")
 
-    if document.status not in {
-        "MANUAL_REVIEW",
-        "READY_FOR_REVIEW",
-    }:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Document cannot be approved "
-                f"from status {document.status}"
-            ),
-        )
+    reason = request_data.reason if request_data and request_data.reason else "Approved by human reviewer"
 
-    # ---------------------------------------------
-    # Approve document
-    # ---------------------------------------------
+    # Update in Notion DOCUMENTS
+    update_document_status(doc_page["id"], "Approved")
 
-    document.status = "APPROVED"
-
-    # ---------------------------------------------
-    # Run Log: document approved
-    # ---------------------------------------------
-
+    # Log to Notion RUN LOG
     create_run_log(
-        db=db,
-        event_type="DOCUMENT_APPROVED",
-        status="APPROVED",
-        message=(
-            f"Document {document.id} manually approved."
-        ),
-        onboarding_id=document.onboarding_id,
-        document_id=document.id,
-    )
-
-    db.commit()
-    db.refresh(document)
-
-    # ---------------------------------------------
-    # Recalculate onboarding status
-    # ---------------------------------------------
-
-    checklist = get_onboarding_checklist(
-        db,
-        document.onboarding_id,
-    )
-
-    return {
-        "document_id": document.id,
-        "document_type": document.document_type,
-        "status": document.status,
-        "onboarding": checklist,
-    }
-
-    # =====================================================
-    # SAVE HUMAN REVIEW DECISION
-    # =====================================================
-
-    review = ReviewDecision(
-        document_id=document.id,
-        decision="APPROVED",
-        reason="Approved by human reviewer.",
-    )
-
-    db.add(review)
-
-    # =====================================================
-    # UPDATE DOCUMENT
-    # =====================================================
-
-    document.status = "APPROVED"
-
-    # =====================================================
-    # RUN LOG: HUMAN APPROVAL
-    # =====================================================
-
-    create_run_log(
-        db=db,
         event_type="HUMAN_APPROVAL",
         status="APPROVED",
-        message="Document approved by human reviewer.",
-        onboarding_id=document.onboarding_id,
-        document_id=document.id,
-    )
-
-    db.commit()
-    db.refresh(document)
-    db.refresh(review)
-
-    # =====================================================
-    # GET UPDATED CHECKLIST
-    # =====================================================
-
-    checklist = get_onboarding_checklist(
-        db,
-        document.onboarding_id,
+        message=f"Document {document_id} manually approved: {reason}",
+        document_id=document_id,
     )
 
     return {
-        "document_id": document.id,
-        "document_type": document.document_type,
-        "status": document.status,
-        "review": {
-            "decision": review.decision,
-            "reason": review.reason,
-        },
-        "onboarding": checklist,
+        "document_id": document_id,
+        "status": "APPROVED",
+        "decision": "APPROVED",
+        "reason": reason,
     }
 
-
-# =========================================================
-# REQUEST DOCUMENT RESEND
-# =========================================================
 
 @app.post("/documents/{document_id}/resend")
 def resend_document(
-    document_id: int,
-    db: Session = Depends(get_db),
+    document_id: str,
+    request_data: ReviewRequest | None = None,
 ):
-    document = db.get(
-        Document,
-        document_id,
-    )
+    notion_documents_id = os.getenv("NOTION_DOCUMENTS_ID")
+    if not notion_documents_id:
+        raise HTTPException(status_code=500, detail="NOTION_DOCUMENTS_ID not configured")
 
-    if not document:
-        raise HTTPException(
-            status_code=404,
-            detail="Document not found",
-        )
+    doc_page = get_document_by_id(notion_documents_id, document_id)
+    if not doc_page:
+        raise HTTPException(status_code=404, detail=f"Document {document_id} not found in Notion")
 
-    # ---------------------------------------------
-    # Mark document for resend
-    # ---------------------------------------------
+    reason = request_data.reason if request_data and request_data.reason else "Document rejected. Resubmission required."
 
-    document.status = "RESEND_REQUIRED"
+    # Update in Notion DOCUMENTS
+    update_document_status(doc_page["id"], "Processing Error")
 
-    # ---------------------------------------------
-    # Run Log: resend requested
-    # ---------------------------------------------
-
+    # Log to Notion RUN LOG
     create_run_log(
-        db=db,
-        event_type="DOCUMENT_RESEND_REQUESTED",
-        status="RESEND_REQUIRED",
-        message=(
-            f"Document {document.id} requires a new upload."
-        ),
-        onboarding_id=document.onboarding_id,
-        document_id=document.id,
-    )
-
-    db.commit()
-    db.refresh(document)
-
-    # ---------------------------------------------
-    # Recalculate onboarding status
-    # ---------------------------------------------
-
-    checklist = get_onboarding_checklist(
-        db,
-        document.onboarding_id,
-    )
-
-    return {
-        "document_id": document.id,
-        "document_type": document.document_type,
-        "status": document.status,
-        "onboarding": checklist,
-    }
-    # =====================================================
-    # SAVE HUMAN REVIEW DECISION
-    # =====================================================
-
-    review = ReviewDecision(
-        document_id=document.id,
-        decision="REJECTED",
-        reason="Document rejected. Resubmission required.",
-    )
-
-    db.add(review)
-
-    # =====================================================
-    # UPDATE DOCUMENT
-    # =====================================================
-
-    document.status = "RESEND_REQUIRED"
-
-    # =====================================================
-    # RUN LOG: HUMAN REJECTION
-    # =====================================================
-
-    create_run_log(
-        db=db,
         event_type="HUMAN_REJECTION",
-        status="REJECTED",
-        message="Document rejected. Resubmission required.",
-        onboarding_id=document.onboarding_id,
-        document_id=document.id,
-    )
-
-    db.commit()
-    db.refresh(document)
-    db.refresh(review)
-
-    # =====================================================
-    # GET UPDATED CHECKLIST
-    # =====================================================
-
-    checklist = get_onboarding_checklist(
-        db,
-        document.onboarding_id,
+        status="RESEND_REQUIRED",
+        message=f"Document {document_id} rejected: {reason}",
+        document_id=document_id,
     )
 
     return {
-        "document_id": document.id,
-        "document_type": document.document_type,
-        "status": document.status,
-        "review": {
-            "decision": review.decision,
-            "reason": review.reason,
-        },
-        "onboarding": checklist,
+        "document_id": document_id,
+        "status": "RESEND_REQUIRED",
+        "decision": "REJECTED",
+        "reason": reason,
     }
 
 
 # =========================================================
-# GENERATE RENT AGREEMENT
+# RENT AGREEMENT GENERATION
 # =========================================================
 
 @app.post("/rent-agreements")
-def create_rent_agreement(
-    data: dict,
-):
+def create_rent_agreement(data: dict):
     try:
-
-        pdf_file = generate_rent_agreement(
-            data
-        )
-
+        pdf_file = generate_rent_agreement(data)
         return StreamingResponse(
             pdf_file,
             media_type="application/pdf",
             headers={
-                "Content-Disposition": (
-                    'attachment; filename="rent_agreement.pdf"'
-                )
+                "Content-Disposition": 'attachment; filename="rent_agreement.pdf"'
             },
         )
-
     except Exception as e:
-
         raise HTTPException(
             status_code=500,
-            detail=(
-                "Failed to generate rent agreement: "
-                f"{str(e)}"
-            ),
+            detail=f"Failed to generate rent agreement: {str(e)}",
         )
 
 
 # =========================================================
-# RUN LOGS
+# RUN LOGS (Fetch from Notion)
 # =========================================================
 
 @app.get("/run-logs")
-def get_run_logs(
-    onboarding_id: int | None = None,
-    db: Session = Depends(get_db),
-):
-    query = db.query(
-        RunLog
-    )
+def get_run_logs():
+    notion_run_log_id = os.getenv("NOTION_RUN_LOG_ID")
+    if not notion_run_log_id:
+        return []
 
-    if onboarding_id is not None:
+    res = query_database(notion_run_log_id)
+    pages = res.get("results", [])
+    logs = []
 
-        query = query.filter(
-            RunLog.onboarding_id == onboarding_id
-        )
+    for p in pages:
+        props = p.get("properties", {})
+        title_prop = props.get("Run ID / Event", {}).get("title", [{}])
+        event_title = title_prop[0].get("plain_text", "") if title_prop else ""
+        outcome_val = props.get("Outcome", {}).get("select", {}).get("name", "")
+        action_prop = props.get("Code Action", {}).get("rich_text", [{}])
+        action_text = action_prop[0].get("plain_text", "") if action_prop else ""
 
-    logs = (
-        query
-        .order_by(
-            RunLog.created_at.desc()
-        )
-        .all()
-    )
+        logs.append({
+            "id": p.get("id"),
+            "event_type": event_title,
+            "outcome": outcome_val,
+            "message": action_text,
+            "created_time": p.get("created_time"),
+        })
 
-    return [
-        {
-            "id": log.id,
-            "onboarding_id": log.onboarding_id,
-            "document_id": log.document_id,
-            "event_type": log.event_type,
-            "status": log.status,
-            "message": log.message,
-            "created_at": log.created_at,
-        }
-        for log in logs
-    ]
+    return logs

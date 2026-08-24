@@ -1,7 +1,9 @@
-from sqlalchemy.orm import Session
-
-from .models import Document, Onboarding
-
+import os
+from .notion_service import (
+    get_onboarding_by_id,
+    get_documents_by_onboarding,
+    update_onboarding_status,
+)
 
 REQUIRED_DOCUMENTS = {
     "PAN",
@@ -11,90 +13,78 @@ REQUIRED_DOCUMENTS = {
 
 
 def get_onboarding_checklist(
-    db: Session,
-    onboarding_id: int,
+    onboarding_id: int | str,
+    db=None,  # optional param for backward compatibility
 ):
-    onboarding = db.get(
-        Onboarding,
-        onboarding_id,
-    )
-
-    if not onboarding:
-        return {
-            "onboarding_id": onboarding_id,
-            "onboarding_status": "NOT_FOUND",
-            "documents": {},
-            "document_details": {},
-        }
-
-    documents = (
-        db.query(Document)
-        .filter(
-            Document.onboarding_id == onboarding_id
-        )
-        .all()
-    )
+    notion_onboarding_id = os.getenv("NOTION_ONBOARDING_ID")
+    notion_documents_id = os.getenv("NOTION_DOCUMENTS_ID")
 
     document_statuses = {
-        document_type: "MISSING"
-        for document_type in REQUIRED_DOCUMENTS
+        doc_type: "MISSING" for doc_type in REQUIRED_DOCUMENTS
     }
-
     document_details = {}
 
-    for document in documents:
-        document_type = str(
-            document.document_type
-        )
+    onboarding_page = None
+    if notion_onboarding_id:
+        try:
+            onboarding_page = get_onboarding_by_id(notion_onboarding_id, onboarding_id)
+        except Exception as e:
+            print(f"Notion get_onboarding failed: {e}")
 
-        # Ignore UNKNOWN documents for the checklist
-        if document_type not in REQUIRED_DOCUMENTS:
-            continue
+    # Query documents from Notion
+    if notion_documents_id and onboarding_page:
+        try:
+            doc_pages = get_documents_by_onboarding(
+                notion_documents_id,
+                onboarding_page_id=onboarding_page.get("id"),
+            )
+            for page in doc_pages:
+                props = page.get("properties", {})
+                doc_type_raw = props.get("Document Type", {}).get("select", {}).get("name", "")
+                norm_type = "AADHAAR" if doc_type_raw == "AADHAR" else doc_type_raw
 
-        document_statuses[document_type] = str(
-            document.status
-        )
+                if norm_type in REQUIRED_DOCUMENTS:
+                    val_status = props.get("Validation Status", {}).get("status", {}).get("name", "Processing Error")
+                    mapped_status = "APPROVED" if val_status == "Approved" else ("MANUAL_REVIEW" if val_status == "Manual Review" else "PROCESSING_ERROR")
+                    
+                    document_statuses[norm_type] = mapped_status
+                    doc_id_title = props.get("Document ID", {}).get("title", [{}])[0].get("plain_text", "")
+                    
+                    document_details[norm_type] = {
+                        "document_id": doc_id_title,
+                        "notion_page_id": page.get("id"),
+                        "status": mapped_status,
+                        "extracted_name": props.get("Extracted Name ", {}).get("rich_text", [{}])[0].get("plain_text", "") if props.get("Extracted Name ", {}).get("rich_text") else None,
+                        "extracted_number": props.get("Extracted Number", {}).get("rich_text", [{}])[0].get("plain_text", "") if props.get("Extracted Number", {}).get("rich_text") else None,
+                    }
+        except Exception as e:
+            print(f"Notion get_documents failed: {e}")
 
-        document_details[document_type] = {
-            "document_id": document.id,
-            "filename": document.filename,
-            "status": str(document.status),
-            "extracted_data": document.extracted_data or {},
-        }
-
-    # -----------------------------------------------------
     # Determine onboarding status
-    # -----------------------------------------------------
-
     statuses = list(document_statuses.values())
-
-    # Any required document is still missing
-    if any(
-        status == "MISSING"
-        for status in statuses
-    ):
-        onboarding.status = "IN_PROGRESS"
-
-    # All required documents are approved
-    elif all(
-        status == "APPROVED"
-        for status in statuses
-    ):
-        onboarding.status = "APPROVED"
-
-    # Required documents exist, but one or more
-    # still need human review
+    if any(status == "MISSING" for status in statuses):
+        calculated_status = "IN_PROGRESS"
+    elif all(status == "APPROVED" for status in statuses):
+        calculated_status = "APPROVED"
     else:
-        onboarding.status = "PENDING_REVIEW"
+        calculated_status = "PENDING_REVIEW"
 
-    db.commit()
-    db.refresh(onboarding)
+    # Update status in Notion if changed
+    if onboarding_page and notion_onboarding_id:
+        try:
+            notion_status_map = {
+                "IN_PROGRESS": "In Progress",
+                "PENDING_REVIEW": "Pending Review",
+                "APPROVED": "Completed",
+                "COMPLETED": "Completed",
+            }
+            update_onboarding_status(onboarding_page["id"], notion_status_map.get(calculated_status, "In Progress"))
+        except Exception as e:
+            print(f"Notion update_onboarding_status failed: {e}")
 
     return {
-        "onboarding_id": onboarding.id,
-        "onboarding_status": str(
-            onboarding.status
-        ),
+        "onboarding_id": onboarding_id,
+        "onboarding_status": calculated_status,
         "documents": document_statuses,
         "document_details": document_details,
     }

@@ -1,18 +1,6 @@
-from datetime import date, datetime
+from datetime import datetime
 from enum import Enum
-
-from sqlalchemy import (
-    Date,
-    DateTime,
-    ForeignKey,
-    JSON,
-    String,
-    Text,
-    func,
-)
-from sqlalchemy.orm import Mapped, mapped_column
-
-from .database import Base
+from pydantic import BaseModel, Field
 
 
 class OnboardingStatus(str, Enum):
@@ -40,225 +28,30 @@ class DocumentType(str, Enum):
     RENT_AGREEMENT = "RENT_AGREEMENT"
 
 
-class Property(Base):
-    __tablename__ = "properties"
-
-    id: Mapped[int] = mapped_column(
-        primary_key=True,
-    )
-
-    name: Mapped[str] = mapped_column(
-        String(200),
-        nullable=False,
-    )
-
-    address: Mapped[str] = mapped_column(
-        String(500),
-        nullable=False,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
+class ReviewDecision(BaseModel):
+    decision: str
+    reason: str | None = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
-class Tenant(Base):
-    __tablename__ = "tenants"
-
-    id: Mapped[int] = mapped_column(
-        primary_key=True,
-    )
-
-    property_id: Mapped[int] = mapped_column(
-        ForeignKey("properties.id"),
-        nullable=False,
-    )
-
-    name: Mapped[str] = mapped_column(
-        String(200),
-        nullable=False,
-    )
-
-    phone: Mapped[str] = mapped_column(
-        String(30),
-        nullable=False,
-    )
-
-    unit_number: Mapped[str] = mapped_column(
-        String(50),
-        nullable=False,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
+class DocumentModel(BaseModel):
+    id: str | int
+    onboarding_id: str | int
+    filename: str
+    mime_type: str
+    source: str = "WEB_UPLOAD"
+    storage_path: str
+    document_type: DocumentType = DocumentType.UNKNOWN
+    status: DocumentStatus = DocumentStatus.RECEIVED
+    extracted_data: dict = Field(default_factory=dict)
+    quality_score: float | None = None
+    quality_reason: str | None = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
-class Onboarding(Base):
-    __tablename__ = "onboardings"
-
-    id: Mapped[int] = mapped_column(
-        primary_key=True,
-    )
-
-    tenant_id: Mapped[int] = mapped_column(
-        ForeignKey("tenants.id"),
-        nullable=False,
-    )
-
-    move_in_date: Mapped[date | None] = mapped_column(
-        Date,
-        nullable=True,
-    )
-
-    status: Mapped[OnboardingStatus] = mapped_column(
-        String(30),
-        default=OnboardingStatus.IN_PROGRESS,
-        nullable=False,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
-
-
-class Document(Base):
-    __tablename__ = "documents"
-
-    id: Mapped[int] = mapped_column(
-        primary_key=True,
-    )
-
-    onboarding_id: Mapped[int] = mapped_column(
-        ForeignKey("onboardings.id"),
-        nullable=False,
-    )
-
-    filename: Mapped[str] = mapped_column(
-        String(500),
-        nullable=False,
-    )
-
-    mime_type: Mapped[str] = mapped_column(
-        String(100),
-        nullable=False,
-    )
-
-    source: Mapped[str] = mapped_column(
-        String(50),
-        nullable=False,
-    )
-
-    storage_path: Mapped[str] = mapped_column(
-        String(1000),
-        nullable=False,
-    )
-
-    document_type: Mapped[DocumentType] = mapped_column(
-        String(50),
-        default=DocumentType.UNKNOWN,
-        nullable=False,
-    )
-
-    status: Mapped[DocumentStatus] = mapped_column(
-        String(50),
-        default=DocumentStatus.RECEIVED,
-        nullable=False,
-    )
-
-    quality_score: Mapped[float | None] = mapped_column(
-        nullable=True,
-    )
-
-    quality_reason: Mapped[str | None] = mapped_column(
-        Text,
-        nullable=True,
-    )
-
-    extracted_data: Mapped[dict | None] = mapped_column(
-        JSON,
-        nullable=True,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
-
-    processed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
-        nullable=True,
-    )
-class RunLog(Base):
-    __tablename__ = "run_logs"
-
-    id: Mapped[int] = mapped_column(
-        primary_key=True,
-    )
-
-    onboarding_id: Mapped[int | None] = mapped_column(
-        ForeignKey("onboardings.id"),
-        nullable=True,
-    )
-
-    document_id: Mapped[int | None] = mapped_column(
-        ForeignKey("documents.id"),
-        nullable=True,
-    )
-
-    event_type: Mapped[str] = mapped_column(
-        String(100),
-        nullable=False,
-    )
-
-    status: Mapped[str] = mapped_column(
-        String(50),
-        nullable=False,
-    )
-
-    message: Mapped[str | None] = mapped_column(
-        Text,
-        nullable=True,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
-
-
-class ReviewDecision(Base):
-    __tablename__ = "review_decisions"
-
-    id: Mapped[int] = mapped_column(
-        primary_key=True,
-    )
-
-    document_id: Mapped[int] = mapped_column(
-        ForeignKey("documents.id"),
-        nullable=False,
-    )
-
-    decision: Mapped[str] = mapped_column(
-        String(30),
-        nullable=False,
-    )
-
-    reason: Mapped[str | None] = mapped_column(
-        Text,
-        nullable=True,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-    )
+class OnboardingModel(BaseModel):
+    id: str | int
+    tenant_name: str
+    property_name: str | None = None
+    status: OnboardingStatus = OnboardingStatus.IN_PROGRESS
+    created_at: datetime = Field(default_factory=datetime.utcnow)

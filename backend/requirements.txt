@@ -1,9 +1,9 @@
-
 fastapi
 uvicorn[standard]
-sqlalchemy
-psycopg[binary]
 pydantic-settings
 python-multipart
 pillow
 pymupdf
+google-genai
+python-dotenv
+reportlab
