@@ -12,6 +12,23 @@ DATABASES = {
     "RUN_LOG": os.getenv("NOTION_RUN_LOG_ID"),
 }
 
+def get_text_from_prop(prop_obj: dict | None) -> str:
+    if not prop_obj:
+        return ""
+    if prop_obj.get("title"):
+        return prop_obj["title"][0].get("plain_text", "") if prop_obj["title"] else ""
+    if prop_obj.get("rich_text"):
+        return prop_obj["rich_text"][0].get("plain_text", "") if prop_obj["rich_text"] else ""
+    if prop_obj.get("select"):
+        return prop_obj["select"].get("name", "") if prop_obj["select"] else ""
+    if prop_obj.get("status"):
+        return prop_obj["status"].get("name", "") if prop_obj["status"] else ""
+    if prop_obj.get("number") is not None:
+        return str(prop_obj.get("number"))
+    if prop_obj.get("url"):
+        return str(prop_obj.get("url"))
+    return ""
+
 def print_table(title, rows):
     print(f"\n{'='*70}")
     print(f" 📂 NOTION: {title} ({len(rows)} entries)")
@@ -29,63 +46,67 @@ def main():
 
     # 1. Onboardings
     if DATABASES["ONBOARDINGS"]:
-        res = query_database(DATABASES["ONBOARDINGS"])
-        rows = []
-        for p in res.get("results", []):
-            props = p.get("properties", {})
-            title = props.get("Onboarding ID", {}).get("title", [{}])[0].get("plain_text", "")
-            tenant = props.get("Tenant Name", {}).get("rich_text", [{}])[0].get("plain_text", "") if props.get("Tenant Name", {}).get("rich_text") else ""
-            status = props.get("Onboarding Status", {}).get("status", {}).get("name", "")
-            rows.append({"ID": title, "Tenant": tenant, "Status": status})
-        print_table("ONBOARDINGS", rows)
+        try:
+            res = query_database(DATABASES["ONBOARDINGS"])
+            rows = []
+            for p in res.get("results", []):
+                props = p.get("properties", {})
+                title = get_text_from_prop(props.get("Onboarding ID"))
+                tenant = get_text_from_prop(props.get("Tenant Name"))
+                phone = get_text_from_prop(props.get("Tenant Phone"))
+                prop_name = get_text_from_prop(props.get("Property Nmae")) or get_text_from_prop(props.get("Property/PG"))
+                status = get_text_from_prop(props.get("Onboarding Status"))
+                rows.append({"ID": title, "Tenant": tenant, "Phone": phone, "Property": prop_name, "Status": status})
+            print_table("ONBOARDINGS", rows)
+        except Exception as e:
+            print(f"❌ Error fetching ONBOARDINGS: {e}")
 
     # 2. Documents
     if DATABASES["DOCUMENTS"]:
-        res = query_database(DATABASES["DOCUMENTS"])
-        rows = []
-        for p in res.get("results", []):
-            props = p.get("properties", {})
-            doc_id = props.get("Document ID", {}).get("title", [{}])[0].get("plain_text", "")
-            doc_type = props.get("Document Type", {}).get("select", {}).get("name", "")
-            val_status = props.get("Validation Status", {}).get("status", {}).get("name", "")
-            num = props.get("Extracted Number", {}).get("rich_text", [{}])[0].get("plain_text", "") if props.get("Extracted Number", {}).get("rich_text") else ""
-            rows.append({"Doc ID": doc_id, "Type": doc_type, "Status": val_status, "Number": num})
-        print_table("DOCUMENTS", rows)
+        try:
+            res = query_database(DATABASES["DOCUMENTS"])
+            rows = []
+            for p in res.get("results", []):
+                props = p.get("properties", {})
+                doc_id = get_text_from_prop(props.get("Document ID"))
+                doc_type = get_text_from_prop(props.get("Document Type"))
+                val_status = get_text_from_prop(props.get("Validation Status"))
+                num = get_text_from_prop(props.get("Extracted Number"))
+                name = get_text_from_prop(props.get("Extracted Name"))
+                rows.append({"Doc ID": doc_id, "Type": doc_type, "Name": name, "Status": val_status, "Number": num})
+            print_table("DOCUMENTS", rows)
+        except Exception as e:
+            print(f"❌ Error fetching DOCUMENTS: {e}")
 
     # 3. Review Queue
     if DATABASES["REVIEW_QUEUE"]:
-        res = query_database(DATABASES["REVIEW_QUEUE"])
-        rows = []
-        for p in res.get("results", []):
-            props = p.get("properties", {})
-            task = props.get("Review Task", {}).get("title", [{}])[0].get("plain_text", "")
-            decision = props.get("Reviewer Decision", {}).get("status", {}).get("name", "")
-            reason = props.get("Stop Reason", {}).get("rich_text", [{}])[0].get("plain_text", "") if props.get("Stop Reason", {}).get("rich_text") else ""
-            rows.append({"Task": task, "Decision": decision, "Stop Reason": reason[:40]})
-        print_table("REVIEW QUEUE", rows)
+        try:
+            res = query_database(DATABASES["REVIEW_QUEUE"])
+            rows = []
+            for p in res.get("results", []):
+                props = p.get("properties", {})
+                task = get_text_from_prop(props.get("Review Task"))
+                decision = get_text_from_prop(props.get("Reviewer Decision"))
+                reason = get_text_from_prop(props.get("Reason")) or get_text_from_prop(props.get("Stop Reason"))
+                rows.append({"Task": task, "Decision": decision, "Reason": reason[:45]})
+            print_table("REVIEW QUEUE", rows)
+        except Exception as e:
+            print(f"❌ Error fetching REVIEW QUEUE: {e}")
 
-    # 4. Rent Agreements
-    if DATABASES["RENT_AGREEMENTS"]:
-        res = query_database(DATABASES["RENT_AGREEMENTS"])
-        rows = []
-        for p in res.get("results", []):
-            props = p.get("properties", {})
-            name = props.get("Name", {}).get("title", [{}])[0].get("plain_text", "") if props.get("Name", {}).get("title") else "Agreement"
-            generate_now = props.get("[ ] Generate Now", {}).get("checkbox", False)
-            rows.append({"Name": name, "Generate Now Checkbox": generate_now})
-        print_table("RENT AGREEMENTS", rows)
-
-    # 5. Run Log
+    # 4. Run Log
     if DATABASES["RUN_LOG"]:
-        res = query_database(DATABASES["RUN_LOG"])
-        rows = []
-        for p in res.get("results", [])[:5]:
-            props = p.get("properties", {})
-            event = props.get("Run ID / Event", {}).get("title", [{}])[0].get("plain_text", "")
-            outcome = props.get("Outcome", {}).get("select", {}).get("name", "")
-            action = props.get("Code Action", {}).get("rich_text", [{}])[0].get("plain_text", "") if props.get("Code Action", {}).get("rich_text") else ""
-            rows.append({"Event": event, "Outcome": outcome, "Action": action[:45]})
-        print_table("RUN LOG (Latest 5)", rows)
+        try:
+            res = query_database(DATABASES["RUN_LOG"])
+            rows = []
+            for p in res.get("results", []):
+                props = p.get("properties", {})
+                run_id = get_text_from_prop(props.get("Run ID / Event"))
+                outcome = get_text_from_prop(props.get("Outcome"))
+                action = get_text_from_prop(props.get("Code Action"))
+                rows.append({"Run / Event": run_id, "Outcome": outcome, "Action": action[:60]})
+            print_table("RUN LOG", rows)
+        except Exception as e:
+            print(f"❌ Error fetching RUN LOG: {e}")
 
 if __name__ == "__main__":
     main()

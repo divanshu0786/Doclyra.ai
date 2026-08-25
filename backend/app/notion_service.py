@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Any
 from urllib import request, error
 from dotenv import load_dotenv
@@ -118,8 +119,10 @@ def create_onboarding_item(
     tenant_name: str,
     status: str = "In Progress",
     property_name: str | None = None,
+    property_address: str | None = None,
+    tenant_phone: str | int | None = None,
 ) -> dict:
-    valid_statuses = {"In Progress", "Pending Review", "Blocked", "Completed"}
+    valid_statuses = {"In Progress", "Pending Review", "Completed"}
     chosen_status = status if status in valid_statuses else "In Progress"
 
     props: dict[str, Any] = {
@@ -142,18 +145,44 @@ def create_onboarding_item(
             ]
         },
         "Onboarding Status": {
-            "status": {
+            "select": {
                 "name": chosen_status
             }
         },
     }
 
     if property_name:
-        props["Property/PG"] = {
-            "select": {
-                "name": property_name
-            }
+        props["Property Nmae"] = {
+            "rich_text": [
+                {
+                    "text": {
+                        "content": property_name
+                    }
+                }
+            ]
         }
+
+    if property_address:
+        props["Property Address"] = {
+            "rich_text": [
+                {
+                    "text": {
+                        "content": property_address
+                    }
+                }
+            ]
+        }
+
+    if tenant_phone:
+        # Extract digits for number column
+        digits = "".join(re.findall(r"\d+", str(tenant_phone)))
+        if digits:
+            try:
+                props["Tenant Phone"] = {
+                    "number": int(digits[-10:])
+                }
+            except Exception:
+                pass
 
     return create_page(database_id, props)
 
@@ -174,18 +203,44 @@ def get_onboarding_by_id(database_id: str, onboarding_id: int | str) -> dict | N
 
 
 def update_onboarding_status(page_id: str, status: str) -> dict:
-    valid_statuses = {"In Progress", "Pending Review", "Blocked", "Completed"}
+    valid_statuses = {"In Progress", "Pending Review", "Completed"}
     chosen_status = status if status in valid_statuses else "In Progress"
 
     return update_page(
         page_id,
         {
             "Onboarding Status": {
-                "status": {
+                "select": {
                     "name": chosen_status
                 }
             }
         }
+    )
+
+
+def get_all_onboardings(database_id: str) -> list:
+    try:
+        res = query_database(database_id)
+        return res.get("results", [])
+    except Exception:
+        return []
+
+
+def update_onboarding_id(page_id: str, onboarding_id: int | str) -> dict:
+    target_id = f"ONB-{onboarding_id}" if not str(onboarding_id).startswith("ONB-") else str(onboarding_id)
+    return update_page(
+        page_id,
+        {
+            "Onboarding ID": {
+                "title": [
+                    {
+                        "text": {
+                            "content": target_id
+                        }
+                    }
+                ]
+            }
+        },
     )
 
 
@@ -199,27 +254,30 @@ def create_document_item(
     doc_type: str,
     name: str | None = None,
     number: str | None = None,
-    validation_status: str = "Ready for review",
+    validation_status: str = "Manual Review",
     onboarding_page_id: str | None = None,
+    file_url: str | None = None,
 ) -> dict:
     type_map = {
         "AADHAAR": "AADHAR",
         "AADHAR": "AADHAR",
         "PAN": "PAN",
         "RENT_AGREEMENT": "RENT_AGREEMENT",
+        "PASSPORT_PHOTO": "PASSPORT_PHOTO",
+        "PASSPORT": "PASSPORT_PHOTO",
     }
-    doc_type_val = type_map.get(doc_type.upper())
+    doc_type_val = type_map.get(doc_type.upper(), "AADHAR")
 
     status_map = {
         "APPROVED": "Approved",
+        "VALID": "Approved",
         "MANUAL_REVIEW": "Manual Review",
+        "REVIEW": "Manual Review",
         "PROCESSING_ERROR": "Processing Error",
         "QUALITY_FAILED": "Processing Error",
-        "READY": "Ready for review",
-        "READY_FOR_REVIEW": "Ready for review",
+        "REJECTED": "Processing Error",
     }
-    chosen_status = status_map.get(validation_status.upper(), "Ready for review")
-
+    chosen_status = status_map.get(validation_status.upper(), "Manual Review")
     doc_title = f"DOC-{document_id}" if not str(document_id).startswith("DOC-") else str(document_id)
 
     props: dict[str, Any] = {
@@ -232,20 +290,16 @@ def create_document_item(
                 }
             ]
         },
-        "Extracted Name ": {
+        "Document Type": {
+            "select": {
+                "name": doc_type_val
+            }
+        },
+        "Extracted Name": {
             "rich_text": [
                 {
                     "text": {
                         "content": name or ""
-                    }
-                }
-            ]
-        },
-        "Extracted Number": {
-            "rich_text": [
-                {
-                    "text": {
-                        "content": number or ""
                     }
                 }
             ]
@@ -257,12 +311,15 @@ def create_document_item(
         },
     }
 
-    if doc_type_val:
-        props["Document Type"] = {
-            "select": {
-                "name": doc_type_val
-            }
-        }
+    if number:
+        digits = "".join(re.findall(r"\d+", number))
+        if digits:
+            try:
+                props["Extracted Number"] = {
+                    "number": int(digits[-12:])
+                }
+            except Exception:
+                pass
 
     if onboarding_page_id:
         props["Related Onboarding"] = {
@@ -271,6 +328,11 @@ def create_document_item(
                     "id": onboarding_page_id
                 }
             ]
+        }
+
+    if file_url:
+        props["File link/View"] = {
+            "url": file_url
         }
 
     return create_page(database_id, props)
@@ -308,14 +370,14 @@ def get_document_by_id(database_id: str, document_id: int | str) -> dict | None:
 def update_document_status(page_id: str, status: str) -> dict:
     status_map = {
         "APPROVED": "Approved",
+        "VALID": "Approved",
         "MANUAL_REVIEW": "Manual Review",
+        "REVIEW": "Manual Review",
         "PROCESSING_ERROR": "Processing Error",
         "QUALITY_FAILED": "Processing Error",
-        "READY": "Ready for review",
-        "READY_FOR_REVIEW": "Ready for review",
-        "RESEND_REQUIRED": "Processing Error",
+        "REJECTED": "Processing Error",
     }
-    chosen_status = status_map.get(status.upper(), "Ready for review")
+    chosen_status = status_map.get(status.upper(), "Manual Review")
 
     return update_page(
         page_id,
@@ -341,7 +403,7 @@ def create_review_queue_item(
     decision: str = "Pending",
     document_page_id: str | None = None,
 ) -> dict:
-    valid_decisions = {"Pending", "Override", "Reject", "Approve"}
+    valid_decisions = {"Pending", "Approve", "Reject"}
     chosen_decision = decision if decision in valid_decisions else "Pending"
 
     props: dict[str, Any] = {
@@ -354,20 +416,11 @@ def create_review_queue_item(
                 }
             ]
         },
-        "Review Notes": {
+        "Reason": {
             "rich_text": [
                 {
                     "text": {
-                        "content": review_notes or ""
-                    }
-                }
-            ]
-        },
-        "Stop Reason": {
-            "rich_text": [
-                {
-                    "text": {
-                        "content": stop_reason or ""
+                        "content": stop_reason or review_notes or ""
                     }
                 }
             ]
@@ -380,7 +433,7 @@ def create_review_queue_item(
     }
 
     if document_page_id:
-        props["Document to Review"] = {
+        props["Document to review"] = {
             "relation": [
                 {
                     "id": document_page_id
@@ -396,25 +449,22 @@ def create_review_queue_item(
 # =========================================================
 
 def get_pending_agreement_requests(database_id: str) -> list:
-    """
-    Query the RENT AGREEMENTS database for any rows where '[ ] Generate Now' checkbox is True.
-    """
-    res = query_database(
-        database_id,
-        filter_body={
-            "property": "[ ] Generate Now",
-            "checkbox": {
-                "equals": True
+    try:
+        res = query_database(
+            database_id,
+            filter_body={
+                "property": "[ ] Generate Now",
+                "checkbox": {
+                    "equals": True
+                }
             }
-        }
-    )
-    return res.get("results", [])
+        )
+        return res.get("results", [])
+    except Exception:
+        return []
 
 
 def mark_agreement_as_generated(page_id: str) -> dict:
-    """
-    Reset '[ ] Generate Now' checkbox back to False once processed.
-    """
     return update_page(
         page_id,
         {
@@ -426,7 +476,7 @@ def mark_agreement_as_generated(page_id: str) -> dict:
 
 
 # =========================================================
-# RUN LOG
+# RUN LOG (Graceful fallback if database unlinked)
 # =========================================================
 
 def create_run_log_item(
@@ -440,31 +490,35 @@ def create_run_log_item(
     outcome_val = "Success" if is_success else "Failed"
     action_text = f"[{status}] {message}" if message else status
 
-    return create_page(
-        database_id,
-        {
-            "Run ID / Event": {
-                "title": [
-                    {
-                        "text": {
-                            "content": f"{event_type}_{onboarding_id or 'SYS'}"
+    try:
+        return create_page(
+            database_id,
+            {
+                "Run ID / Event": {
+                    "title": [
+                        {
+                            "text": {
+                                "content": f"{event_type}_{onboarding_id or 'SYS'}"
+                            }
                         }
+                    ]
+                },
+                "Outcome": {
+                    "select": {
+                        "name": outcome_val
                     }
-                ]
-            },
-            "Outcome": {
-                "select": {
-                    "name": outcome_val
-                }
-            },
-            "Code Action": {
-                "rich_text": [
-                    {
-                        "text": {
-                            "content": action_text[:2000]
+                },
+                "Code Action": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": action_text[:2000]
+                            }
                         }
-                    }
-                ]
+                    ]
+                },
             },
-        },
-    )
+        )
+    except Exception as e:
+        print(f"[RUN_LOG] {event_type}: {action_text} ({e})")
+        return {}

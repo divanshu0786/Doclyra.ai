@@ -184,72 +184,30 @@ Return a JSON object with exactly the requested fields.
     # GEMINI EXTRACTION
     # =========================================================
 
-    try:
+    models = ["gemini-3.7-flash", "gemini-3.1-flash-lite-preview", "gemini-3.5-flash"]
+    response = None
 
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=[
-                types.Part.from_text(
-                    text=prompt
+    for model_name in models:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=types.Content(
+                    parts=[
+                        types.Part.from_text(text=prompt),
+                        types.Part.from_bytes(
+                            data=file_data,
+                            mime_type=mime_type,
+                        ),
+                    ]
                 ),
-                types.Part.from_bytes(
-                    data=file_data,
-                    mime_type=mime_type,
-                ),
-            ],
-        )
+            )
+            break
+        except Exception as e:
+            print(f"Gemini extractor {model_name} failed: {e}")
+            continue
 
-    except Exception as e:
-
-        error_text = str(e)
-
-        print(
-            "Gemini extraction error:",
-            error_text,
-        )
-
-        # -----------------------------------------------------
-        # Gemini quota / rate limit
-        # -----------------------------------------------------
-
-        if (
-            "429" in error_text
-            or "RESOURCE_EXHAUSTED"
-            in error_text
-            or "quota"
-            in error_text.lower()
-        ):
-
-            raise RuntimeError(
-                "Gemini API quota exceeded during "
-                "document extraction. "
-                "Please try again later or check "
-                "your Gemini API quota."
-            ) from e
-
-        # -----------------------------------------------------
-        # Gemini temporary unavailable
-        # -----------------------------------------------------
-
-        if (
-            "503" in error_text
-            or "UNAVAILABLE"
-            in error_text
-        ):
-
-            raise RuntimeError(
-                "Gemini API is temporarily unavailable "
-                "during document extraction. "
-                "Please try again later."
-            ) from e
-
-        # -----------------------------------------------------
-        # Other Gemini errors
-        # -----------------------------------------------------
-
-        raise RuntimeError(
-            "Gemini document extraction failed."
-        ) from e
+    if not response:
+        raise RuntimeError("All Gemini extraction models temporarily unavailable. Please try again.")
 
 
     # =========================================================

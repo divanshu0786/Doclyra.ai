@@ -23,11 +23,10 @@ def send_whatsapp_message(
 ) -> dict:
     """
     Send a WhatsApp message via Twilio.
-    to_phone: e.g. "+919996570779"
     """
     client = get_twilio_client()
     from_wa = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
-    
+
     # Format recipient
     clean_to = to_phone.strip().replace(" ", "").replace("-", "")
     if not clean_to.startswith("whatsapp:"):
@@ -55,39 +54,59 @@ def send_tenant_greeting(
     tenant_phone: str,
     onboarding_id: str | int,
     property_name: str | None = None,
+    property_address: str | None = None,
 ) -> dict:
     """
     Send automated greeting and document request message to newly onboarded tenant.
+    Requests: Aadhaar, PAN, Passport size photo, and Rent Agreement.
     """
-    flat = property_name or "your assigned unit"
+    prop = property_name or "your assigned property"
+    addr_text = f" ({property_address})" if property_address else ""
+
     text = (
-        f"👋 *Hello {tenant_name}! Welcome to {flat}.*\n\n"
-        f"Your onboarding has been initiated *(ID: ONB-{onboarding_id})*.\n\n"
-        f"To complete your verification and generate your *Rent Agreement*, "
-        f"please reply directly to this message with clear photos/PDF of:\n"
+        f"👋 *Welcome {tenant_name}!* 🏡\n\n"
+        f"Your onboarding has been initiated for *{prop}*{addr_text} *(ID: ONB-{onboarding_id})*.\n\n"
+        f"To complete your verification, please send clear photos/PDFs of the following 4 documents:\n"
         f"1. 📄 *Aadhaar Card* (Front & Back)\n"
-        f"2. 📄 *PAN Card*\n\n"
-        f"⚡ _Our AI verification engine will process your documents automatically!_"
+        f"2. 📄 *PAN Card*\n"
+        f"3. 📸 *Passport Size Photo* (Clear headshot)\n"
+        f"4. 📝 *Rent Agreement*\n\n"
+        f"⚡ _Our automated AI system will verify them immediately and keep you updated here!_"
     )
 
     return send_whatsapp_message(to_phone=tenant_phone, message_text=text)
 
 
-def send_verification_update(
+def send_approval_notification(
     tenant_phone: str,
     doc_type: str,
-    status: str,
-    details: str | None = None,
+    tenant_name: str | None = None,
 ) -> dict:
     """
-    Notify tenant about document verification result.
+    Notify tenant on WhatsApp that a document has been APPROVED.
     """
-    if status.upper() == "APPROVED":
-        text = f"✅ *{doc_type} Verified Successfully!*\n{details or ''}"
-    else:
-        text = (
-            f"⚠️ *{doc_type} Verification Issue*\n"
-            f"{details or 'The photo was unclear. Please resend a clearer image.'}"
-        )
+    greeting = f"Hi {tenant_name}! " if tenant_name else ""
+    text = (
+        f"✅ *{greeting}Your {doc_type} has been Verified & Approved!*\n\n"
+        f"All details (Name, DOB, format) matched successfully. 🎉"
+    )
+    return send_whatsapp_message(to_phone=tenant_phone, message_text=text)
 
+
+def send_rejection_notification(
+    tenant_phone: str,
+    doc_type: str,
+    layman_reason: str,
+    tenant_name: str | None = None,
+) -> dict:
+    """
+    Notify tenant on WhatsApp that a document was REJECTED with a clear reason.
+    """
+    greeting = f"Hi {tenant_name}, " if tenant_name else ""
+    text = (
+        f"⚠️ *{greeting}Issue with your {doc_type}*\n\n"
+        f"We could not approve this document due to:\n"
+        f"👉 *{layman_reason}*\n\n"
+        f"Please re-upload a clear, correct document to proceed. 🙏"
+    )
     return send_whatsapp_message(to_phone=tenant_phone, message_text=text)
