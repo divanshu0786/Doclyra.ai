@@ -25,9 +25,23 @@ def get_text_from_prop(prop_obj: dict | None) -> str:
         return prop_obj["status"].get("name", "") if prop_obj["status"] else ""
     if prop_obj.get("number") is not None:
         return str(prop_obj.get("number"))
+    if prop_obj.get("checkbox") is not None:
+        return "☑️" if prop_obj.get("checkbox") else "☐"
+    if prop_obj.get("unique_id"):
+        uid = prop_obj.get("unique_id", {})
+        prefix = uid.get("prefix", "ONB")
+        num = uid.get("number", "")
+        return f"{prefix}-{num}" if prefix else str(num)
     if prop_obj.get("url"):
         return str(prop_obj.get("url"))
     return ""
+
+def get_prop_by_name(props: dict, target_name: str) -> dict | None:
+    target_clean = target_name.strip().lower()
+    for k, v in props.items():
+        if k.strip().lower() == target_clean or target_clean in k.strip().lower():
+            return v
+    return None
 
 def print_table(title, rows):
     print(f"\n{'='*70}")
@@ -51,12 +65,14 @@ def main():
             rows = []
             for p in res.get("results", []):
                 props = p.get("properties", {})
-                title = get_text_from_prop(props.get("Onboarding ID"))
-                tenant = get_text_from_prop(props.get("Tenant Name"))
-                phone = get_text_from_prop(props.get("Tenant Phone"))
-                prop_name = get_text_from_prop(props.get("Property Nmae")) or get_text_from_prop(props.get("Property/PG"))
-                status = get_text_from_prop(props.get("Onboarding Status"))
-                rows.append({"ID": title, "Tenant": tenant, "Phone": phone, "Property": prop_name, "Status": status})
+                onb_id = get_text_from_prop(get_prop_by_name(props, "Onboarding ID")) or get_text_from_prop(get_prop_by_name(props, "Onboarding id"))
+                tenant = get_text_from_prop(get_prop_by_name(props, "Tenant Name"))
+                phone = get_text_from_prop(get_prop_by_name(props, "Tenant Phone"))
+                prop_name = get_text_from_prop(get_prop_by_name(props, "Property Name")) or get_text_from_prop(get_prop_by_name(props, "Property/PG"))
+                addr = get_text_from_prop(get_prop_by_name(props, "Property Address"))
+                status = get_text_from_prop(get_prop_by_name(props, "Onboarding Status"))
+                send_msg = get_text_from_prop(get_prop_by_name(props, "Send Message"))
+                rows.append({"ID": onb_id, "Tenant": tenant, "Phone": phone, "Property": prop_name, "Address": addr, "Status": status, "Send Msg": send_msg})
             print_table("ONBOARDINGS", rows)
         except Exception as e:
             print(f"❌ Error fetching ONBOARDINGS: {e}")

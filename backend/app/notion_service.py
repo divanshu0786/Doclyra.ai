@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from typing import Any
 from urllib import request, error
 from dotenv import load_dotenv
@@ -46,7 +47,7 @@ def _request(
     )
 
     try:
-        with request.urlopen(req) as response:
+        with request.urlopen(req, timeout=10) as response:
             response_body = response.read().decode("utf-8")
             if not response_body:
                 return {}
@@ -125,24 +126,21 @@ def create_onboarding_item(
     valid_statuses = {"In Progress", "Pending Review", "Completed"}
     chosen_status = status if status in valid_statuses else "In Progress"
 
+    id_digits = "".join(re.findall(r"\d+", str(onboarding_id)))
+    num_id = int(id_digits) if id_digits else int(time.time()) % 100000
+
     props: dict[str, Any] = {
-        "Onboarding ID": {
+        "Tenant Name ": {
             "title": [
                 {
                     "text": {
-                        "content": f"ONB-{onboarding_id}"
+                        "content": tenant_name or "Tenant"
                     }
                 }
             ]
         },
-        "Tenant Name": {
-            "rich_text": [
-                {
-                    "text": {
-                        "content": tenant_name or ""
-                    }
-                }
-            ]
+        "Onboarding ID": {
+            "number": num_id
         },
         "Onboarding Status": {
             "select": {
@@ -152,29 +150,20 @@ def create_onboarding_item(
     }
 
     if property_name:
-        props["Property Nmae"] = {
-            "rich_text": [
-                {
-                    "text": {
-                        "content": property_name
-                    }
-                }
-            ]
+        props["Property Name"] = {
+            "select": {
+                "name": property_name
+            }
         }
 
     if property_address:
         props["Property Address"] = {
-            "rich_text": [
-                {
-                    "text": {
-                        "content": property_address
-                    }
-                }
-            ]
+            "select": {
+                "name": property_address
+            }
         }
 
     if tenant_phone:
-        # Extract digits for number column
         digits = "".join(re.findall(r"\d+", str(tenant_phone)))
         if digits:
             try:
@@ -188,18 +177,60 @@ def create_onboarding_item(
 
 
 def get_onboarding_by_id(database_id: str, onboarding_id: int | str) -> dict | None:
-    target_id = f"ONB-{onboarding_id}" if not str(onboarding_id).startswith("ONB-") else str(onboarding_id)
-    res = query_database(
-        database_id,
-        filter_body={
-            "property": "Onboarding ID",
-            "title": {
-                "equals": target_id
+    id_digits = "".join(re.findall(r"\d+", str(onboarding_id)))
+    target_num = int(id_digits) if id_digits else None
+    target_title = f"ONB-{onboarding_id}" if not str(onboarding_id).startswith("ONB-") else str(onboarding_id)
+
+    # 1. Try querying by number
+    if target_num is not None:
+        try:
+            res = query_database(
+                database_id,
+                filter_body={
+                    "property": "Onboarding ID",
+                    "number": {
+                        "equals": target_num
+                    }
+                }
+            )
+            results = res.get("results", [])
+            if results:
+                return results[0]
+        except Exception:
+            pass
+
+    # 2. Try querying by title
+    try:
+        res = query_database(
+            database_id,
+            filter_body={
+                "property": "Onboarding ID",
+                "title": {
+                    "equals": target_title
+                }
             }
-        }
-    )
-    results = res.get("results", [])
-    return results[0] if results else None
+        )
+        results = res.get("results", [])
+        if results:
+            return results[0]
+    except Exception:
+        pass
+
+    # 3. Fallback scan all
+    try:
+        all_res = query_database(database_id).get("results", [])
+        for p in all_res:
+            p_props = p.get("properties", {})
+            for key, val in p_props.items():
+                if "onboarding" in key.lower():
+                    if val.get("number") == target_num:
+                        return p
+                    if val.get("title") and val["title"] and target_title in val["title"][0].get("plain_text", ""):
+                        return p
+    except Exception:
+        pass
+
+    return None
 
 
 def update_onboarding_status(page_id: str, status: str) -> dict:
@@ -227,21 +258,47 @@ def get_all_onboardings(database_id: str) -> list:
 
 
 def update_onboarding_id(page_id: str, onboarding_id: int | str) -> dict:
-    target_id = f"ONB-{onboarding_id}" if not str(onboarding_id).startswith("ONB-") else str(onboarding_id)
-    return update_page(
-        page_id,
-        {
-            "Onboarding ID": {
-                "title": [
-                    {
-                        "text": {
-                            "content": target_id
+    id_digits = "".join(re.findall(r"\d+", str(onboarding_id)))
+    num_id = int(id_digits) if id_digits else int(time.time()) % 100000
+    try:
+        return update_page(
+            page_id,
+            {
+                "Onboarding ID": {
+                    "number": num_id
+                }
+            },
+        )
+    except Exception:
+        target_id = f"ONB-{onboarding_id}" if not str(onboarding_id).startswith("ONB-") else str(onboarding_id)
+        return update_page(
+            page_id,
+            {
+                "Onboarding ID": {
+                    "title": [
+                        {
+                            "text": {
+                                "content": target_id
+                            }
                         }
-                    }
-                ]
+                    ]
+                }
+            },
+        )
+
+
+def reset_send_message_checkbox(page_id: str) -> dict:
+    try:
+        return update_page(
+            page_id,
+            {
+                "Send Message": {
+                    "checkbox": False
+                }
             }
-        },
-    )
+        )
+    except Exception:
+        return {}
 
 
 # =========================================================
@@ -281,11 +338,11 @@ def create_document_item(
     doc_title = f"DOC-{document_id}" if not str(document_id).startswith("DOC-") else str(document_id)
 
     props: dict[str, Any] = {
-        "Document ID": {
+        "Tenant Name": {
             "title": [
                 {
                     "text": {
-                        "content": doc_title
+                        "content": name or doc_title
                     }
                 }
             ]

@@ -184,7 +184,7 @@ Return a JSON object with exactly the requested fields.
     # GEMINI EXTRACTION
     # =========================================================
 
-    models = ["gemini-3.7-flash", "gemini-3.1-flash-lite-preview", "gemini-3.5-flash"]
+    models = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"]
     response = None
 
     for model_name in models:

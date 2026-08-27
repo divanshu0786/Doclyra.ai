@@ -1,14 +1,16 @@
 import asyncio
 from contextlib import asynccontextmanager
+import json
 import os
 import re
 import shutil
 import time
 from typing import Any
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi import FastAPI, HTTPException, File, UploadFile, Request, Response, Form
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
+import requests
 
 load_dotenv()
 
@@ -22,6 +24,7 @@ from .document_validator import (
     validate_passport_photo,
 )
 from .whatsapp_service import (
+    send_whatsapp_message,
     send_tenant_greeting,
     send_approval_notification,
     send_rejection_notification,
@@ -45,6 +48,8 @@ from .notion_service import (
     mark_agreement_as_generated,
     get_all_onboardings,
     update_onboarding_id,
+    update_onboarding_status,
+    reset_send_message_checkbox,
 )
 from .models import (
     DocumentType,
@@ -214,8 +219,37 @@ def poll_and_process_rent_agreements() -> dict:
     return {"processed": processed_count, "status": "ok"}
 
 
-# In-memory tracking of onboardings that have already received WhatsApp greeting
-GREETED_ONBOARDINGS: set[str] = set()
+# Persistent tracking of onboardings that have already received WhatsApp greeting
+UPLOAD_DIR = os.path.abspath("uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+GREETED_CACHE_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "uploads",
+    ".greeted_onboardings.json",
+)
+
+
+def load_greeted_cache() -> set[str]:
+    try:
+        if os.path.exists(GREETED_CACHE_FILE):
+            with open(GREETED_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return set(data)
+    except Exception as e:
+        print(f"Warning loading greeted cache: {e}")
+    return set()
+
+
+def save_greeted_cache(greeted_set: set[str]):
+    try:
+        os.makedirs(os.path.dirname(GREETED_CACHE_FILE), exist_ok=True)
+        with open(GREETED_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(greeted_set), f, indent=2)
+    except Exception as e:
+        print(f"Warning saving greeted cache: {e}")
+
+
+GREETED_ONBOARDINGS: set[str] = load_greeted_cache()
 
 
 def extract_notion_text(prop: dict | None) -> str:
@@ -231,13 +265,48 @@ def extract_notion_text(prop: dict | None) -> str:
         return str(prop.get("number"))
     if prop.get("select"):
         return prop["select"].get("name", "") if prop["select"] else ""
+    if prop.get("unique_id"):
+        uid = prop.get("unique_id", {})
+        prefix = uid.get("prefix", "ONB")
+        num = uid.get("number", "")
+        return f"{prefix}-{num}" if prefix else str(num)
+    return ""
+
+
+def get_prop_value(props: dict, key_name: str) -> str:
+    """
+    Finds a property value flexibly by checking exact key, stripped key,
+    and case-insensitive matching. Handles title, rich_text, select, number, unique_id.
+    """
+    if not props:
+        return ""
+
+    target_clean = key_name.strip().lower()
+
+    # 1. Exact / stripped matching
+    for k, v in props.items():
+        if k.strip().lower() == target_clean:
+            return extract_notion_text(v)
+
+    # 2. Substring matching
+    for k, v in props.items():
+        if target_clean in k.strip().lower():
+            return extract_notion_text(v)
+
+    # 3. If looking for tenant name, check if any property is the title column
+    if "tenant" in target_clean or "name" in target_clean:
+        for k, v in props.items():
+            if v.get("type") == "title" or "title" in v:
+                return extract_notion_text(v)
+
     return ""
 
 
 def poll_and_process_new_onboardings() -> dict:
     """
-    Polls Notion ONBOARDINGS database for newly added tenants.
-    Automatically sends WhatsApp greeting & 4-document request message.
+    Polls Notion ONBOARDINGS database for newly added tenants or checked [ ] Send Message boxes.
+    Automatically assigns next sequential Onboarding ID (1, 2, 3...), sets initial status,
+    and sends WhatsApp greeting & 4-document request message.
     """
     notion_onboarding_id = os.getenv("NOTION_ONBOARDING_ID")
     if not notion_onboarding_id:
@@ -246,70 +315,112 @@ def poll_and_process_new_onboardings() -> dict:
     pages = get_all_onboardings(notion_onboarding_id)
     processed_count = 0
 
+    # 1. Collect all existing numeric IDs across the entire database to compute the next auto-ID
+    existing_ids = []
+    for p in pages:
+        p_props = p.get("properties", {})
+        id_str = get_prop_value(p_props, "Onboarding ID") or get_prop_value(p_props, "Onboarding id")
+        digits = "".join(re.findall(r"\d+", str(id_str)))
+        if digits:
+            try:
+                existing_ids.append(int(digits))
+            except Exception:
+                pass
+
+    next_auto_id = max(existing_ids, default=0) + 1
+
     for page in pages:
         page_id = page.get("id")
         if not page_id:
             continue
 
         props = page.get("properties", {})
-        raw_id = extract_notion_text(props.get("Onboarding ID"))
-        tenant_name = extract_notion_text(props.get("Tenant Name"))
-        raw_phone = extract_notion_text(props.get("Tenant Phone"))
+        raw_id = get_prop_value(props, "Onboarding ID") or get_prop_value(props, "Onboarding id")
+        tenant_name = get_prop_value(props, "Tenant Name") or get_prop_value(props, "Tenant Name ")
+        raw_phone = get_prop_value(props, "Tenant Phone")
         property_name = (
-            extract_notion_text(props.get("Property Nmae"))
-            or extract_notion_text(props.get("Property/PG"))
+            get_prop_value(props, "Property Name")
+            or get_prop_value(props, "Property Nmae")
+            or get_prop_value(props, "Property/PG")
             or "your assigned property"
         )
-        property_address = extract_notion_text(props.get("Property Address"))
+        property_address = get_prop_value(props, "Property Address")
 
-        # Skip if page already greeted
-        if page_id in GREETED_ONBOARDINGS:
-            continue
-        if raw_id and raw_id in GREETED_ONBOARDINGS:
-            GREETED_ONBOARDINGS.add(page_id)
-            continue
+        # Auto-set initial status to 'In Progress' if empty
+        curr_status = get_prop_value(props, "Onboarding Status")
+        if not curr_status and tenant_name:
+            try:
+                update_onboarding_status(page_id, "In Progress")
+            except Exception as e:
+                print(f"Error setting default status for {tenant_name}: {e}")
+
+        # Check Send Message checkbox
+        send_msg_prop = props.get("Send Message", {})
+        send_message_checked = bool(send_msg_prop.get("checkbox", False)) if send_msg_prop else False
+
+        # Assign next sequential Onboarding ID if missing in Notion
+        if not raw_id or raw_id.strip() == "":
+            if tenant_name:
+                clean_onb_id = str(next_auto_id)
+                next_auto_id += 1
+                try:
+                    update_onboarding_id(page_id, int(clean_onb_id))
+                    print(f"🔢 Auto-assigned Onboarding ID #{clean_onb_id} to tenant '{tenant_name}' in Notion")
+                except Exception as e:
+                    print(f"Error updating Onboarding ID in Notion: {e}")
+            else:
+                clean_onb_id = ""
+        else:
+            id_digits = "".join(re.findall(r"\d+", raw_id))
+            clean_onb_id = id_digits if id_digits else raw_id.replace("ONB-", "").strip()
+
+        # Skip if page already greeted unless explicitly requested via checkbox
+        if not send_message_checked:
+            if page_id in GREETED_ONBOARDINGS:
+                continue
+            if clean_onb_id and clean_onb_id in GREETED_ONBOARDINGS:
+                GREETED_ONBOARDINGS.add(page_id)
+                continue
+            if clean_onb_id and f"ONB-{clean_onb_id}" in GREETED_ONBOARDINGS:
+                GREETED_ONBOARDINGS.add(page_id)
+                continue
 
         # Need phone number to send WhatsApp greeting
         if not raw_phone:
             continue
 
-        # Format phone number to international standard (E.164)
+        # Extract digits
         digits = "".join(re.findall(r"\d+", raw_phone))
-        if not digits:
+        # Must have at least 10 digits to be a valid phone number
+        if len(digits) < 10:
             continue
 
         if len(digits) == 10:
             formatted_phone = f"+91{digits}"
         elif digits.startswith("91") and len(digits) == 12:
             formatted_phone = f"+{digits}"
-        elif raw_phone.startswith("+"):
-            formatted_phone = raw_phone.strip()
+        elif raw_phone.startswith("+") and len(digits) >= 10:
+            formatted_phone = raw_phone.strip().replace(" ", "").replace("-", "")
         else:
             formatted_phone = f"+{digits}"
 
-        # Assign an Onboarding ID if missing in Notion
-        if not raw_id or raw_id.strip() == "":
-            gen_num = int(time.time()) % 100000
-            try:
-                update_onboarding_id(page_id, gen_num)
-            except Exception as e:
-                print(f"Error updating Onboarding ID in Notion: {e}")
-            clean_onb_id = str(gen_num)
-        else:
-            clean_onb_id = raw_id.replace("ONB-", "")
-
-        # Record in processed set
+        # Record in persistent processed cache
         GREETED_ONBOARDINGS.add(page_id)
-        if raw_id:
-            GREETED_ONBOARDINGS.add(raw_id)
-        GREETED_ONBOARDINGS.add(f"ONB-{clean_onb_id}")
+        if clean_onb_id:
+            GREETED_ONBOARDINGS.add(clean_onb_id)
+            GREETED_ONBOARDINGS.add(f"ONB-{clean_onb_id}")
+        save_greeted_cache(GREETED_ONBOARDINGS)
+
+        # Reset checkbox in Notion if it was checked
+        if send_message_checked:
+            reset_send_message_checkbox(page_id)
 
         # Send automated WhatsApp greeting
         try:
             send_tenant_greeting(
                 tenant_name=tenant_name or "Tenant",
                 tenant_phone=formatted_phone,
-                onboarding_id=clean_onb_id,
+                onboarding_id=clean_onb_id or "1",
                 property_name=property_name,
                 property_address=property_address,
             )
@@ -317,7 +428,7 @@ def poll_and_process_new_onboardings() -> dict:
                 event_type="WHATSAPP_GREETING_SENT",
                 status="SUCCESS",
                 message=f"Auto-detected Notion entry: Greeting sent to {formatted_phone}",
-                onboarding_id=clean_onb_id,
+                onboarding_id=clean_onb_id or "1",
             )
             print(f"✅ Auto-sent WhatsApp greeting to {tenant_name} ({formatted_phone}) for ONB-{clean_onb_id}")
             processed_count += 1
@@ -327,8 +438,10 @@ def poll_and_process_new_onboardings() -> dict:
                 event_type="WHATSAPP_GREETING_FAILED",
                 status="FAILED",
                 message=f"Auto-greeting failed: {e}",
-                onboarding_id=clean_onb_id,
+                onboarding_id=clean_onb_id or "1",
             )
+
+    return {"processed": processed_count, "status": "ok"}
 
     return {"processed": processed_count, "status": "ok"}
 
@@ -340,19 +453,19 @@ def poll_and_process_new_onboardings() -> dict:
 async def agreement_polling_loop():
     while True:
         try:
-            poll_and_process_rent_agreements()
-        except Exception:
-            pass
-        await asyncio.sleep(10)
+            await asyncio.to_thread(poll_and_process_rent_agreements)
+        except Exception as e:
+            print(f"Error in agreement poller: {e}")
+        await asyncio.sleep(5)
 
 
 async def onboarding_polling_loop():
     while True:
         try:
-            poll_and_process_new_onboardings()
+            await asyncio.to_thread(poll_and_process_new_onboardings)
         except Exception as e:
             print(f"Error in onboarding poller: {e}")
-        await asyncio.sleep(10)
+        await asyncio.sleep(5)
 
 
 @asynccontextmanager
@@ -422,6 +535,7 @@ def create_onboarding(
         if page and page.get("id"):
             GREETED_ONBOARDINGS.add(page.get("id"))
             GREETED_ONBOARDINGS.add(f"ONB-{chosen_id}")
+            save_greeted_cache(GREETED_ONBOARDINGS)
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -948,3 +1062,298 @@ def get_run_logs():
         })
 
     return logs
+
+
+# =========================================================
+# TWILIO INBOUND WHATSAPP WEBHOOK (AUTOMATIC PROCESSING)
+# =========================================================
+
+@app.get("/uploads/{filename:path}")
+def get_uploaded_file(filename: str):
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path)
+
+
+@app.post("/whatsapp/webhook")
+@app.post("/")
+def whatsapp_webhook(
+    From: str = Form(""),
+    Body: str = Form(""),
+    NumMedia: str = Form("0"),
+    MediaUrl0: str | None = Form(None),
+    MediaContentType0: str | None = Form(None),
+    ProfileName: str | None = Form(None),
+):
+    """
+    Twilio Inbound WhatsApp Webhook.
+    Receives incoming WhatsApp messages, photos, and PDFs sent by tenants.
+    Automatically classifies with Gemini, extracts, validates, updates Notion, and replies on WhatsApp.
+    """
+    from_phone = From
+    clean_phone = str(from_phone).replace("whatsapp:", "").strip()
+    body = str(Body).strip()
+    num_media = int(str(NumMedia)) if str(NumMedia).isdigit() else 0
+    media_url = MediaUrl0
+    media_type = MediaContentType0
+    profile_name = str(ProfileName or "")
+
+    print(f"📩 Inbound WhatsApp from {clean_phone} | Media count: {num_media} | Body: {body}")
+
+    # Look up tenant's Onboarding in Notion using phone number
+    notion_onboarding_id = os.getenv("NOTION_ONBOARDING_ID")
+    notion_documents_id = os.getenv("NOTION_DOCUMENTS_ID")
+    target_digits = "".join(re.findall(r"\d+", clean_phone))[-10:]
+
+    onb_page = None
+    if notion_onboarding_id and target_digits:
+        all_pages = get_all_onboardings(notion_onboarding_id)
+        for p in all_pages:
+            props = p.get("properties", {})
+            p_phone = extract_notion_text(props.get("Tenant Phone"))
+            p_digits = "".join(re.findall(r"\d+", p_phone))[-10:]
+            if p_digits and p_digits == target_digits:
+                onb_page = p
+                break
+        if not onb_page and all_pages:
+            onb_page = all_pages[0]
+
+    onb_id_str = "1"
+    tenant_name = profile_name or "Tenant"
+    if onb_page:
+        props = onb_page.get("properties", {})
+        raw_onb_id = extract_notion_text(props.get("Onboarding ID"))
+        onb_id_str = raw_onb_id.replace("ONB-", "").strip() if raw_onb_id else "1"
+        t_name = extract_notion_text(props.get("Tenant Name"))
+        if t_name:
+            tenant_name = t_name
+
+    # If NO media attached (Text message only)
+    if num_media == 0 or not media_url:
+        reply_text = (
+            f"👋 *Hi {tenant_name}!* 🏡\n\n"
+            f"Please send a clear photo or PDF of your document (*Aadhaar Card, PAN Card, Passport Photo, or Rent Agreement*) "
+            f"so our AI system can automatically verify it for your onboarding *(ID: ONB-{onb_id_str})*."
+        )
+        send_whatsapp_message(to_phone=clean_phone, message_text=reply_text)
+        return Response(content="<Response></Response>", media_type="application/xml")
+
+    # If media attached: Download from Twilio
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+
+    upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    doc_num_id = int(time.time() * 1000) % 1000000
+    ext = "jpg"
+    if "pdf" in str(media_type).lower():
+        ext = "pdf"
+    elif "png" in str(media_type).lower():
+        ext = "png"
+    storage_filename = f"onb_{onb_id_str}_{doc_num_id}_wa.{ext}"
+    storage_path = os.path.join(upload_dir, storage_filename)
+
+    try:
+        resp = requests.get(str(media_url), auth=(account_sid, auth_token), timeout=30)
+        if resp.status_code != 200:
+            send_whatsapp_message(
+                to_phone=clean_phone,
+                message_text="⚠️ Could not download your document from WhatsApp. Please try sending it again.",
+            )
+            return Response(content="<Response></Response>", media_type="application/xml")
+
+        with open(storage_path, "wb") as f:
+            f.write(resp.content)
+    except Exception as e:
+        print(f"Error downloading Twilio media: {e}")
+        send_whatsapp_message(
+            to_phone=clean_phone,
+            message_text="⚠️ Error receiving your file. Please try re-uploading.",
+        )
+        return Response(content="<Response></Response>", media_type="application/xml")
+
+    content_type_str = str(media_type) if media_type else ("application/pdf" if ext == "pdf" else "image/jpeg")
+
+    create_run_log(
+        event_type="DOCUMENT_RECEIVED",
+        status="RECEIVED",
+        message=f"WhatsApp upload: {storage_filename} from {clean_phone}",
+        onboarding_id=onb_id_str,
+        document_id=doc_num_id,
+    )
+
+    # 1. Quality Inspection
+    inspection = inspect_document(storage_path, content_type_str)
+    quality_status = inspection.get("quality", "GOOD")
+    quality_reason = str(inspection.get("quality_reason", ""))
+
+    if quality_status != "GOOD":
+        if notion_documents_id:
+            create_document_item(
+                database_id=notion_documents_id,
+                document_id=doc_num_id,
+                doc_type="UNKNOWN",
+                validation_status="Processing Error",
+                onboarding_page_id=onb_page.get("id") if onb_page else None,
+            )
+        send_rejection_notification(
+            tenant_phone=clean_phone,
+            doc_type="Document",
+            layman_reason=f"Image quality issue: {quality_reason}",
+            tenant_name=tenant_name,
+        )
+        return Response(content="<Response></Response>", media_type="application/xml")
+
+    # 2. AI Classification with Gemini
+    try:
+        classified_type = classify_document(storage_path, content_type_str)
+    except Exception as e:
+        classified_type = "UNKNOWN"
+        print(f"Classification error: {e}")
+
+    if classified_type == "UNKNOWN":
+        if notion_documents_id:
+            create_document_item(
+                database_id=notion_documents_id,
+                document_id=doc_num_id,
+                doc_type="UNKNOWN",
+                validation_status="Processing Error",
+                onboarding_page_id=onb_page.get("id") if onb_page else None,
+            )
+        send_rejection_notification(
+            tenant_phone=clean_phone,
+            doc_type="Document",
+            layman_reason="Unrecognized document type. Please upload a clear Aadhaar, PAN, Passport Photo, or Rent Agreement.",
+            tenant_name=tenant_name,
+        )
+        return Response(content="<Response></Response>", media_type="application/xml")
+
+    # 3. AI Extraction
+    extracted_data = {}
+    if classified_type in ["PAN", "AADHAAR", "RENT_AGREEMENT"]:
+        try:
+            extracted_data = extract_document_data(
+                file_path=storage_path,
+                mime_type=content_type_str,
+                document_type=classified_type,
+            )
+        except Exception as e:
+            print(f"Extraction error: {e}")
+
+    # 4. Validation
+    if classified_type == "PAN":
+        validation_res = validate_pan(extracted_data, expected_name=tenant_name)
+    elif classified_type == "AADHAAR":
+        validation_res = validate_aadhaar(extracted_data, expected_name=tenant_name)
+    elif classified_type == "RENT_AGREEMENT":
+        validation_res = validate_rent_agreement(extracted_data, expected_name=tenant_name)
+    elif classified_type == "PASSPORT_PHOTO":
+        validation_res = validate_passport_photo(storage_path, content_type_str)
+    else:
+        validation_res = {"decision": "REJECTED", "reason": "Unsupported document"}
+
+    final_status = validation_res.get("decision", "MANUAL_REVIEW")
+    extracted_num = validation_res.get("extracted_number") or extracted_data.get("pan_number") or extracted_data.get("aadhaar_number")
+    extracted_name_val = validation_res.get("extracted_name") or extracted_data.get("name")
+
+    # 5. Determine File View Link for Broker
+    filename = os.path.basename(storage_path)
+    file_view_link = f"http://localhost:8000/uploads/{filename}"
+
+    # 6. Sync to Notion DOCUMENTS
+    doc_page = None
+    if notion_documents_id:
+        doc_page = create_document_item(
+            database_id=notion_documents_id,
+            document_id=doc_num_id,
+            doc_type=classified_type,
+            name=extracted_name_val,
+            number=extracted_num,
+            validation_status=final_status,
+            onboarding_page_id=onb_page.get("id") if onb_page else None,
+            file_url=file_view_link,
+        )
+
+    # 7. Outcome handling & Automatic Status Progression
+    if final_status == "APPROVED":
+        create_run_log(
+            event_type="DOCUMENT_VALIDATION",
+            status="APPROVED",
+            message=f"{classified_type} verified and approved for {tenant_name}",
+            onboarding_id=onb_id_str,
+            document_id=doc_num_id,
+        )
+        send_approval_notification(
+            tenant_phone=clean_phone,
+            doc_type=classified_type,
+            tenant_name=tenant_name,
+        )
+
+        # Check if all required documents (AADHAR & PAN) are approved -> Automatically Mark Onboarding as Completed!
+        if onb_page and notion_documents_id:
+            onb_page_id = onb_page.get("id")
+            try:
+                tenant_docs = get_documents_by_onboarding(notion_documents_id, onb_page_id)
+                approved_types = set()
+                for td in tenant_docs:
+                    td_props = td.get("properties", {})
+                    td_status = td_props.get("Validation Status", {}).get("status", {}).get("name", "")
+                    td_type = td_props.get("Document Type", {}).get("select", {}).get("name", "")
+                    if td_status == "Approved" and td_type:
+                        approved_types.add(td_type.upper())
+
+                # Include current approved document
+                approved_types.add(classified_type.upper())
+
+                if "AADHAR" in approved_types and "PAN" in approved_types:
+                    update_onboarding_status(onb_page_id, "Completed")
+                    send_whatsapp_message(
+                        to_phone=clean_phone,
+                        message_text=f"🎉 *Congratulations {tenant_name}!* All your required documents have been verified and approved. Your onboarding is now *Completed*! 🏡✨",
+                    )
+                    create_run_log(
+                        event_type="ONBOARDING_COMPLETED",
+                        status="SUCCESS",
+                        message=f"All documents approved for {tenant_name} (ONB-{onb_id_str})",
+                        onboarding_id=onb_id_str,
+                    )
+                    print(f"🏆 Onboarding ONB-{onb_id_str} ({tenant_name}) marked COMPLETED in Notion!")
+            except Exception as e:
+                print(f"Error checking onboarding completion: {e}")
+
+    elif final_status == "MANUAL_REVIEW":
+        # Automatically flip Onboarding Status to 'Pending Review'
+        if onb_page:
+            try:
+                update_onboarding_status(onb_page.get("id"), "Pending Review")
+            except Exception as e:
+                print(f"Error setting status to Pending Review: {e}")
+
+        notion_review_id = os.getenv("NOTION_REVIEW_QUEUE_ID")
+        review_reason = validation_res.get("reason", "Needs broker review")
+        if notion_review_id and doc_page:
+            try:
+                create_review_queue_item(
+                    database_id=notion_review_id,
+                    task_title=f"REV-{doc_num_id}",
+                    review_notes=review_reason,
+                    stop_reason=review_reason,
+                    document_page_id=doc_page.get("id"),
+                )
+            except Exception as e:
+                print(f"Error creating review item: {e}")
+        send_whatsapp_message(
+            to_phone=clean_phone,
+            message_text=f"📋 *Hi {tenant_name}!* Your *{classified_type}* has been received and forwarded for broker review. We'll update you shortly!",
+        )
+    else:  # REJECTED
+        rej_reason = validation_res.get("reason", "Document validation failed")
+        send_rejection_notification(
+            tenant_phone=clean_phone,
+            doc_type=classified_type,
+            layman_reason=rej_reason,
+            tenant_name=tenant_name,
+        )
+
+    return Response(content="<Response></Response>", media_type="application/xml")
