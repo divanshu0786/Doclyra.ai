@@ -501,6 +501,60 @@ def create_review_queue_item(
     return create_page(database_id, props)
 
 
+def get_pending_review_queue_items(database_id: str) -> list:
+    """
+    Finds review tasks where broker has selected 'Approve' or 'Reject'.
+    """
+    try:
+        res = query_database(
+            database_id,
+            filter_body={
+                "or": [
+                    {
+                        "property": "Reviewer Decision",
+                        "status": {
+                            "equals": "Approve"
+                        }
+                    },
+                    {
+                        "property": "Reviewer Decision",
+                        "status": {
+                            "equals": "Reject"
+                        }
+                    },
+                ]
+            }
+        )
+        return res.get("results", [])
+    except Exception:
+        try:
+            res = query_database(database_id)
+            items = []
+            for p in res.get("results", []):
+                dec = p.get("properties", {}).get("Reviewer Decision", {}).get("status", {}).get("name", "")
+                if dec in {"Approve", "Reject"}:
+                    items.append(p)
+            return items
+        except Exception:
+            return []
+
+
+def update_review_task_decision(page_id: str, decision: str) -> dict:
+    try:
+        return update_page(
+            page_id,
+            {
+                "Reviewer Decision": {
+                    "status": {
+                        "name": decision
+                    }
+                }
+            }
+        )
+    except Exception:
+        return {}
+
+
 # =========================================================
 # RENT AGREEMENTS DATABASE POLLING
 # =========================================================

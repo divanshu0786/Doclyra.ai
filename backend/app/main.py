@@ -43,6 +43,8 @@ from .notion_service import (
     get_documents_by_onboarding,
     update_document_status,
     create_review_queue_item,
+    get_pending_review_queue_items,
+    update_review_task_decision,
     query_database,
     get_pending_agreement_requests,
     mark_agreement_as_generated,
@@ -234,7 +236,8 @@ def load_greeted_cache() -> set[str]:
         if os.path.exists(GREETED_CACHE_FILE):
             with open(GREETED_CACHE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return set(data)
+                # Keep only valid Notion page UUIDs (never keep generic integers like '1' or '2')
+                return {x for x in data if len(x) >= 30 and "-" in x}
     except Exception as e:
         print(f"Warning loading greeted cache: {e}")
     return set()
@@ -250,6 +253,54 @@ def save_greeted_cache(greeted_set: set[str]):
 
 
 GREETED_ONBOARDINGS: set[str] = load_greeted_cache()
+
+DOC_DISPLAY_NAMES = {
+    "AADHAR": "Aadhaar Card",
+    "AADHAAR": "Aadhaar Card",
+    "PAN": "PAN Card",
+    "PASSPORT_PHOTO": "Passport Size Photo",
+    "PASSPORT_SIZE_PHOTO": "Passport Size Photo",
+    "RENT_AGREEMENT": "Rent Agreement",
+}
+
+
+def get_onboarding_progress(tenant_docs: list, current_approved_type: str | None = None) -> tuple[int, str, bool]:
+    """
+    Evaluates completion across the 4 required documents:
+    1. Aadhaar Card
+    2. PAN Card
+    3. Passport Size Photo
+    4. Rent Agreement
+    """
+    approved_types = set()
+    for td in tenant_docs:
+        td_props = td.get("properties", {})
+        td_status = td_props.get("Validation Status", {}).get("status", {}).get("name", "")
+        td_type = td_props.get("Document Type", {}).get("select", {}).get("name", "")
+        if td_status == "Approved" and td_type:
+            norm = "PASSPORT_PHOTO" if "PASSPORT" in td_type.upper() else td_type.upper()
+            if norm == "AADHAAR":
+                norm = "AADHAR"
+            approved_types.add(norm)
+
+    if current_approved_type:
+        norm_curr = "PASSPORT_PHOTO" if "PASSPORT" in current_approved_type.upper() else current_approved_type.upper()
+        if norm_curr == "AADHAAR":
+            norm_curr = "AADHAR"
+        approved_types.add(norm_curr)
+
+    req_keys = ["AADHAR", "PAN", "PASSPORT_PHOTO", "RENT_AGREEMENT"]
+    completed_count = sum(1 for k in req_keys if k in approved_types)
+    all_completed = (completed_count == 4)
+
+    items = []
+    for k in req_keys:
+        name = DOC_DISPLAY_NAMES.get(k, k)
+        status_icon = "✅" if k in approved_types else "⏳"
+        items.append(f"{name} {status_icon}")
+
+    progress_summary = f"({completed_count}/4 completed: " + ", ".join(items) + ")"
+    return completed_count, progress_summary, all_completed
 
 
 def extract_notion_text(prop: dict | None) -> str:
@@ -320,7 +371,7 @@ def poll_and_process_new_onboardings() -> dict:
     for p in pages:
         p_props = p.get("properties", {})
         id_str = get_prop_value(p_props, "Onboarding ID") or get_prop_value(p_props, "Onboarding id")
-        digits = "".join(re.findall(r"\d+", str(id_str)))
+        digits = "".join(re.findall(r"\d+", id_str))
         if digits:
             try:
                 existing_ids.append(int(digits))
@@ -374,16 +425,13 @@ def poll_and_process_new_onboardings() -> dict:
             id_digits = "".join(re.findall(r"\d+", raw_id))
             clean_onb_id = id_digits if id_digits else raw_id.replace("ONB-", "").strip()
 
-        # Skip if page already greeted unless explicitly requested via checkbox
+        # ONLY send WhatsApp greeting when the broker explicitly checks [ ] Send Message!
         if not send_message_checked:
-            if page_id in GREETED_ONBOARDINGS:
-                continue
-            if clean_onb_id and clean_onb_id in GREETED_ONBOARDINGS:
-                GREETED_ONBOARDINGS.add(page_id)
-                continue
-            if clean_onb_id and f"ONB-{clean_onb_id}" in GREETED_ONBOARDINGS:
-                GREETED_ONBOARDINGS.add(page_id)
-                continue
+            continue
+
+        if page_id in GREETED_ONBOARDINGS:
+            reset_send_message_checkbox(page_id)
+            continue
 
         # Need phone number to send WhatsApp greeting
         if not raw_phone:
@@ -404,16 +452,10 @@ def poll_and_process_new_onboardings() -> dict:
         else:
             formatted_phone = f"+{digits}"
 
-        # Record in persistent processed cache
+        # Record page_id in persistent processed cache and reset checkbox
         GREETED_ONBOARDINGS.add(page_id)
-        if clean_onb_id:
-            GREETED_ONBOARDINGS.add(clean_onb_id)
-            GREETED_ONBOARDINGS.add(f"ONB-{clean_onb_id}")
         save_greeted_cache(GREETED_ONBOARDINGS)
-
-        # Reset checkbox in Notion if it was checked
-        if send_message_checked:
-            reset_send_message_checkbox(page_id)
+        reset_send_message_checkbox(page_id)
 
         # Send automated WhatsApp greeting
         try:
@@ -427,7 +469,7 @@ def poll_and_process_new_onboardings() -> dict:
             create_run_log(
                 event_type="WHATSAPP_GREETING_SENT",
                 status="SUCCESS",
-                message=f"Auto-detected Notion entry: Greeting sent to {formatted_phone}",
+                message=f"Greeting sent to {formatted_phone}",
                 onboarding_id=clean_onb_id or "1",
             )
             print(f"✅ Auto-sent WhatsApp greeting to {tenant_name} ({formatted_phone}) for ONB-{clean_onb_id}")
@@ -443,21 +485,143 @@ def poll_and_process_new_onboardings() -> dict:
 
     return {"processed": processed_count, "status": "ok"}
 
+
+PROCESSED_REVIEW_TASKS: set[str] = set()
+
+def poll_and_process_review_queue() -> dict:
+    """
+    Polls Notion REVIEW QUEUE database for tasks where broker has selected 'Approve' or 'Reject'.
+    Automatically updates the linked Document in DOCUMENTS, checks for Onboarding completion,
+    and notifies the tenant on WhatsApp!
+    """
+    notion_review_id = os.getenv("NOTION_REVIEW_QUEUE_ID")
+    notion_documents_id = os.getenv("NOTION_DOCUMENTS_ID")
+    if not notion_review_id:
+        return {"processed": 0, "message": "NOTION_REVIEW_QUEUE_ID not configured"}
+
+    review_pages = get_pending_review_queue_items(notion_review_id)
+    processed_count = 0
+
+    for page in review_pages:
+        page_id = page.get("id")
+        if not page_id:
+            continue
+
+        props = page.get("properties", {})
+        decision = props.get("Reviewer Decision", {}).get("status", {}).get("name", "")
+        if decision not in {"Approve", "Reject"}:
+            continue
+
+        # Prevent re-processing the same task repeatedly
+        task_marker = f"{page_id}_{decision}"
+        if task_marker in PROCESSED_REVIEW_TASKS:
+            continue
+
+        reason = get_prop_value(props, "Reason") or "Broker Review Decision"
+        doc_relations = props.get("Document to review", {}).get("relation", [])
+        if not doc_relations:
+            continue
+
+        doc_page_id = doc_relations[0].get("id")
+        try:
+            doc_page = get_page(doc_page_id)
+        except Exception as e:
+            print(f"Error fetching linked document page {doc_page_id}: {e}")
+            continue
+
+        doc_props = doc_page.get("properties", {})
+        doc_type = get_prop_value(doc_props, "Document Type") or "Document"
+        tenant_name = get_prop_value(doc_props, "Tenant Name") or "Tenant"
+
+        # Find tenant phone and onboarding page from Related Onboarding
+        onb_relations = doc_props.get("Related Onboarding", {}).get("relation", [])
+        onb_page = None
+        onb_page_id = None
+        clean_phone = ""
+        onb_id_str = "1"
+
+        if onb_relations:
+            onb_page_id = onb_relations[0].get("id")
+            try:
+                onb_page = get_page(onb_page_id)
+                o_props = onb_page.get("properties", {})
+                raw_phone = get_prop_value(o_props, "Tenant Phone")
+                digits = "".join(re.findall(r"\d+", raw_phone))
+                if len(digits) >= 10:
+                    clean_phone = f"+91{digits[-10:]}"
+                tenant_name = get_prop_value(o_props, "Tenant Name") or tenant_name
+                onb_id_str = get_prop_value(o_props, "Onboarding ID") or "1"
+            except Exception as e:
+                print(f"Error fetching onboarding page for review: {e}")
+
+        if decision == "Approve":
+            # 1. Update Document status to 'Approved'
+            try:
+                update_document_status(doc_page_id, "Approved")
+                print(f"✅ Broker review: Document {doc_type} for {tenant_name} set to Approved!")
+            except Exception as e:
+                print(f"Error updating doc status: {e}")
+
+            # 2. Check 4-document progress
+            tenant_docs = []
+            if onb_page_id and notion_documents_id:
+                try:
+                    tenant_docs = get_documents_by_onboarding(notion_documents_id, onb_page_id)
+                except Exception as e:
+                    print(f"Error fetching docs: {e}")
+
+            doc_display = DOC_DISPLAY_NAMES.get(doc_type, doc_type)
+            completed_count, progress_summary, all_completed = get_onboarding_progress(tenant_docs, doc_type)
+
+            if all_completed and onb_page_id:
+                update_onboarding_status(onb_page_id, "Completed")
+                if clean_phone:
+                    send_whatsapp_message(
+                        to_phone=clean_phone,
+                        message_text=(
+                            f"🎉 *Congratulations {tenant_name}!* All 4 required documents have been verified and approved!\n\n"
+                            f"📋 *Final Status:* 4/4 Verified (Aadhaar ✅, PAN ✅, Passport Size Photo ✅, Rent Agreement ✅)\n"
+                            f"Your onboarding is now *Completed*! 🏡✨"
+                        ),
+                    )
+                print(f"🏆 Broker review completed: ONB-{onb_id_str} ({tenant_name}) marked COMPLETED in Notion!")
+            else:
+                if clean_phone:
+                    send_whatsapp_message(
+                        to_phone=clean_phone,
+                        message_text=(
+                            f"✅ *Hi {tenant_name}!* Your *{doc_display}* has been reviewed & *APPROVED* by the broker! 🎉\n\n"
+                            f"📊 *Verification Progress:* {progress_summary}\n"
+                            f"_Please upload your remaining documents to complete onboarding._"
+                        ),
+                    )
+
+        elif decision == "Reject":
+            try:
+                update_document_status(doc_page_id, "Processing Error")
+            except Exception as e:
+                print(f"Error updating doc status: {e}")
+
+            doc_display = DOC_DISPLAY_NAMES.get(doc_type, doc_type)
+            if clean_phone:
+                send_whatsapp_message(
+                    to_phone=clean_phone,
+                    message_text=(
+                        f"⚠️ *Hi {tenant_name}!* Your *{doc_display}* was rejected during broker review:\n"
+                        f"_{reason}_\n\n"
+                        f"Please re-upload a clear, correct document."
+                    ),
+                )
+
+        PROCESSED_REVIEW_TASKS.add(task_marker)
+        processed_count += 1
+
     return {"processed": processed_count, "status": "ok"}
 
 
 # =========================================================
 # LIFESPAN & BACKGROUND POLLING WORKERS
 # =========================================================
-
-async def agreement_polling_loop():
-    while True:
-        try:
-            await asyncio.to_thread(poll_and_process_rent_agreements)
-        except Exception as e:
-            print(f"Error in agreement poller: {e}")
-        await asyncio.sleep(5)
-
 
 async def onboarding_polling_loop():
     while True:
@@ -468,15 +632,24 @@ async def onboarding_polling_loop():
         await asyncio.sleep(5)
 
 
+async def review_queue_polling_loop():
+    while True:
+        try:
+            await asyncio.to_thread(poll_and_process_review_queue)
+        except Exception as e:
+            print(f"Error in review queue poller: {e}")
+        await asyncio.sleep(5)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    agreement_task = asyncio.create_task(agreement_polling_loop())
     onboarding_task = asyncio.create_task(onboarding_polling_loop())
+    review_task = asyncio.create_task(review_queue_polling_loop())
     try:
         yield
     finally:
-        agreement_task.cancel()
         onboarding_task.cancel()
+        review_task.cancel()
 
 
 app = FastAPI(
@@ -1092,12 +1265,12 @@ def whatsapp_webhook(
     Automatically classifies with Gemini, extracts, validates, updates Notion, and replies on WhatsApp.
     """
     from_phone = From
-    clean_phone = str(from_phone).replace("whatsapp:", "").strip()
-    body = str(Body).strip()
-    num_media = int(str(NumMedia)) if str(NumMedia).isdigit() else 0
+    clean_phone = from_phone.replace("whatsapp:", "").strip()
+    body = Body.strip()
+    num_media = int(NumMedia) if NumMedia.isdigit() else 0
     media_url = MediaUrl0
     media_type = MediaContentType0
-    profile_name = str(ProfileName or "")
+    profile_name = ProfileName or ""
 
     print(f"📩 Inbound WhatsApp from {clean_phone} | Media count: {num_media} | Body: {body}")
 
@@ -1121,6 +1294,7 @@ def whatsapp_webhook(
 
     onb_id_str = "1"
     tenant_name = profile_name or "Tenant"
+    property_name = "your assigned property"
     if onb_page:
         props = onb_page.get("properties", {})
         raw_onb_id = extract_notion_text(props.get("Onboarding ID"))
@@ -1128,6 +1302,12 @@ def whatsapp_webhook(
         t_name = extract_notion_text(props.get("Tenant Name"))
         if t_name:
             tenant_name = t_name
+        property_name = (
+            get_prop_value(props, "Property Name")
+            or get_prop_value(props, "Property Nmae")
+            or get_prop_value(props, "Property/PG")
+            or "your assigned property"
+        )
 
     # If NO media attached (Text message only)
     if num_media == 0 or not media_url:
@@ -1155,7 +1335,11 @@ def whatsapp_webhook(
     storage_path = os.path.join(upload_dir, storage_filename)
 
     try:
-        resp = requests.get(str(media_url), auth=(account_sid, auth_token), timeout=30)
+        resp = requests.get(
+            media_url,
+            auth=(account_sid or "", auth_token or ""),
+            timeout=30,
+        )
         if resp.status_code != 200:
             send_whatsapp_message(
                 to_phone=clean_phone,
@@ -1173,7 +1357,7 @@ def whatsapp_webhook(
         )
         return Response(content="<Response></Response>", media_type="application/xml")
 
-    content_type_str = str(media_type) if media_type else ("application/pdf" if ext == "pdf" else "image/jpeg")
+    content_type_str = media_type if media_type else ("application/pdf" if ext == "pdf" else "image/jpeg")
 
     create_run_log(
         event_type="DOCUMENT_RECEIVED",
@@ -1249,11 +1433,17 @@ def whatsapp_webhook(
     elif classified_type == "RENT_AGREEMENT":
         validation_res = validate_rent_agreement(extracted_data, expected_name=tenant_name)
     elif classified_type == "PASSPORT_PHOTO":
-        validation_res = validate_passport_photo(storage_path, content_type_str)
+        validation_res = validate_passport_photo(inspection)
     else:
-        validation_res = {"decision": "REJECTED", "reason": "Unsupported document"}
+        validation_res = {"valid": False, "status": "REJECTED", "reason": "Unsupported document"}
 
-    final_status = validation_res.get("decision", "MANUAL_REVIEW")
+    if validation_res.get("valid") is True or validation_res.get("status") in {"VALID", "APPROVED"}:
+        final_status = "APPROVED"
+    elif validation_res.get("status") == "MANUAL_REVIEW":
+        final_status = "MANUAL_REVIEW"
+    else:
+        final_status = "REJECTED"
+
     extracted_num = validation_res.get("extracted_number") or extracted_data.get("pan_number") or extracted_data.get("aadhaar_number")
     extracted_name_val = validation_res.get("extracted_name") or extracted_data.get("name")
 
@@ -1276,51 +1466,59 @@ def whatsapp_webhook(
         )
 
     # 7. Outcome handling & Automatic Status Progression
+    doc_display = DOC_DISPLAY_NAMES.get(classified_type, classified_type)
+    detailed_error = (
+        validation_res.get("error")
+        or " | ".join(validation_res.get("errors", []))
+        or validation_res.get("reason")
+        or "Details need broker verification"
+    )
+
     if final_status == "APPROVED":
         create_run_log(
             event_type="DOCUMENT_VALIDATION",
             status="APPROVED",
-            message=f"{classified_type} verified and approved for {tenant_name}",
+            message=f"{doc_display} verified and approved for {tenant_name}",
             onboarding_id=onb_id_str,
             document_id=doc_num_id,
         )
-        send_approval_notification(
-            tenant_phone=clean_phone,
-            doc_type=classified_type,
-            tenant_name=tenant_name,
-        )
 
-        # Check if all required documents (AADHAR & PAN) are approved -> Automatically Mark Onboarding as Completed!
+        # Check 4-document completion progress
+        tenant_docs = []
         if onb_page and notion_documents_id:
-            onb_page_id = onb_page.get("id")
             try:
-                tenant_docs = get_documents_by_onboarding(notion_documents_id, onb_page_id)
-                approved_types = set()
-                for td in tenant_docs:
-                    td_props = td.get("properties", {})
-                    td_status = td_props.get("Validation Status", {}).get("status", {}).get("name", "")
-                    td_type = td_props.get("Document Type", {}).get("select", {}).get("name", "")
-                    if td_status == "Approved" and td_type:
-                        approved_types.add(td_type.upper())
-
-                # Include current approved document
-                approved_types.add(classified_type.upper())
-
-                if "AADHAR" in approved_types and "PAN" in approved_types:
-                    update_onboarding_status(onb_page_id, "Completed")
-                    send_whatsapp_message(
-                        to_phone=clean_phone,
-                        message_text=f"🎉 *Congratulations {tenant_name}!* All your required documents have been verified and approved. Your onboarding is now *Completed*! 🏡✨",
-                    )
-                    create_run_log(
-                        event_type="ONBOARDING_COMPLETED",
-                        status="SUCCESS",
-                        message=f"All documents approved for {tenant_name} (ONB-{onb_id_str})",
-                        onboarding_id=onb_id_str,
-                    )
-                    print(f"🏆 Onboarding ONB-{onb_id_str} ({tenant_name}) marked COMPLETED in Notion!")
+                tenant_docs = get_documents_by_onboarding(notion_documents_id, onb_page.get("id"))
             except Exception as e:
-                print(f"Error checking onboarding completion: {e}")
+                print(f"Error fetching onboarding documents: {e}")
+
+        completed_count, progress_summary, all_completed = get_onboarding_progress(tenant_docs, classified_type)
+
+        if all_completed and onb_page:
+            update_onboarding_status(onb_page.get("id"), "Completed")
+            send_whatsapp_message(
+                to_phone=clean_phone,
+                message_text=(
+                    f"🎉 *Congratulations {tenant_name}!* All 4 required documents have been verified and approved!\n\n"
+                    f"📋 *Final Status:* 4/4 Verified (Aadhaar ✅, PAN ✅, Passport Size Photo ✅, Rent Agreement ✅)\n"
+                    f"Your onboarding for *{property_name}* is now *Completed*! 🏡✨"
+                ),
+            )
+            create_run_log(
+                event_type="ONBOARDING_COMPLETED",
+                status="SUCCESS",
+                message=f"All 4 documents approved for {tenant_name} (ONB-{onb_id_str})",
+                onboarding_id=onb_id_str,
+            )
+            print(f"🏆 Onboarding ONB-{onb_id_str} ({tenant_name}) marked COMPLETED in Notion!")
+        else:
+            send_whatsapp_message(
+                to_phone=clean_phone,
+                message_text=(
+                    f"✅ *Hi {tenant_name}!* Your *{doc_display}* has been verified & approved! 🎉\n\n"
+                    f"📊 *Verification Progress:* {progress_summary}\n"
+                    f"_Please send your remaining documents to complete onboarding._"
+                ),
+            )
 
     elif final_status == "MANUAL_REVIEW":
         # Automatically flip Onboarding Status to 'Pending Review'
@@ -1331,29 +1529,34 @@ def whatsapp_webhook(
                 print(f"Error setting status to Pending Review: {e}")
 
         notion_review_id = os.getenv("NOTION_REVIEW_QUEUE_ID")
-        review_reason = validation_res.get("reason", "Needs broker review")
         if notion_review_id and doc_page:
             try:
                 create_review_queue_item(
                     database_id=notion_review_id,
                     task_title=f"REV-{doc_num_id}",
-                    review_notes=review_reason,
-                    stop_reason=review_reason,
+                    review_notes=detailed_error,
+                    stop_reason=detailed_error,
                     document_page_id=doc_page.get("id"),
                 )
             except Exception as e:
                 print(f"Error creating review item: {e}")
+
         send_whatsapp_message(
             to_phone=clean_phone,
-            message_text=f"📋 *Hi {tenant_name}!* Your *{classified_type}* has been received and forwarded for broker review. We'll update you shortly!",
+            message_text=(
+                f"📋 *Hi {tenant_name}!* Your *{doc_display}* has been received and forwarded for broker review.\n\n"
+                f"🔍 *Reason:* _{detailed_error}_\n"
+                f"We will update you as soon as the broker reviews it!"
+            ),
         )
     else:  # REJECTED
-        rej_reason = validation_res.get("reason", "Document validation failed")
-        send_rejection_notification(
-            tenant_phone=clean_phone,
-            doc_type=classified_type,
-            layman_reason=rej_reason,
-            tenant_name=tenant_name,
+        send_whatsapp_message(
+            to_phone=clean_phone,
+            message_text=(
+                f"⚠️ *Issue with your {doc_display}:*\n"
+                f"_{detailed_error}_\n\n"
+                f"Please re-upload a clear, valid photo/document."
+            ),
         )
 
     return Response(content="<Response></Response>", media_type="application/xml")

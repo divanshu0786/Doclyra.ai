@@ -137,13 +137,22 @@ def validate_aadhaar(data: dict, expected_name: str | None = None) -> dict:
         errors.append("Date of birth / Year of birth is missing on Aadhaar card.")
 
     # 4. GENDER
-    gender = str(data.get("gender") or "").strip().upper()
-    if gender.lower() in {"null", "none"}:
-        gender = ""
+    raw_gender = str(data.get("gender") or "").strip().upper()
+    if raw_gender.lower() in {"null", "none"}:
+        raw_gender = ""
 
-    if not gender:
+    valid_gender_detected = False
+    if raw_gender:
+        if "FEMALE" in raw_gender:
+            valid_gender_detected = True
+        elif "MALE" in raw_gender:
+            valid_gender_detected = True
+        elif "TRANSGENDER" in raw_gender or "OTHER" in raw_gender:
+            valid_gender_detected = True
+
+    if not raw_gender:
         errors.append("Gender is missing on Aadhaar card.")
-    elif gender not in {"MALE", "FEMALE", "TRANSGENDER", "OTHER"}:
+    elif not valid_gender_detected:
         errors.append("Gender is invalid on Aadhaar card.")
 
     if errors:
