@@ -1486,7 +1486,7 @@ def whatsapp_webhook(
         all_pages = get_all_onboardings(notion_onboarding_id)
         for p in all_pages:
             props = p.get("properties", {})
-            p_phone = extract_notion_text(props.get("Tenant Phone"))
+            p_phone = get_prop_value(props, "Tenant Phone")
             p_digits = "".join(re.findall(r"\d+", p_phone))[-10:]
             if p_digits and p_digits == target_digits:
                 onb_page = p
@@ -1495,15 +1495,15 @@ def whatsapp_webhook(
             onb_page = all_pages[0]
 
     onb_id_str = "1"
-    tenant_name = profile_name or "Tenant"
+    tenant_name = "Tenant"
     property_name = "your assigned property"
     if onb_page:
         props = onb_page.get("properties", {})
-        raw_onb_id = extract_notion_text(props.get("Onboarding ID"))
+        raw_onb_id = get_prop_value(props, "Onboarding ID")
         onb_id_str = raw_onb_id.replace("ONB-", "").strip() if raw_onb_id else "1"
-        t_name = extract_notion_text(props.get("Tenant Name"))
+        t_name = get_prop_value(props, "Tenant Name")
         if t_name:
-            tenant_name = t_name
+            tenant_name = t_name.strip()
         property_name = (
             get_prop_value(props, "Property Name")
             or get_prop_value(props, "Property Nmae")
