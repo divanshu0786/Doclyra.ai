@@ -254,6 +254,31 @@ def save_greeted_cache(greeted_set: set[str]):
 
 GREETED_ONBOARDINGS: set[str] = load_greeted_cache()
 
+REMINDER_CACHE_FILE = os.path.join(UPLOAD_DIR, ".reminder_tracking.json")
+REMINDER_INTERVAL_SECONDS = int(os.getenv("REMINDER_INTERVAL_HOURS", "6")) * 3600  # Default 6 hours
+
+
+def load_reminder_cache() -> dict[str, float]:
+    try:
+        if os.path.exists(REMINDER_CACHE_FILE):
+            with open(REMINDER_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Warning loading reminder cache: {e}")
+    return {}
+
+
+def save_reminder_cache(cache: dict[str, float]):
+    try:
+        os.makedirs(os.path.dirname(REMINDER_CACHE_FILE), exist_ok=True)
+        with open(REMINDER_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2)
+    except Exception as e:
+        print(f"Warning saving reminder cache: {e}")
+
+
+REMINDER_TRACKING: dict[str, float] = load_reminder_cache()
+
 DOC_DISPLAY_NAMES = {
     "AADHAR": "Aadhaar Card",
     "AADHAAR": "Aadhaar Card",
@@ -619,6 +644,128 @@ def poll_and_process_review_queue() -> dict:
     return {"processed": processed_count, "status": "ok"}
 
 
+def poll_and_send_pending_reminders() -> dict:
+    """
+    Scans Notion ONBOARDINGS database.
+    If a tenant is in 'In Progress' or 'Pending Review' status,
+    and has not submitted all 4 documents within the last 6 hours,
+    sends an automated polite WhatsApp follow-up nudge!
+    """
+    notion_onboarding_id = os.getenv("NOTION_ONBOARDING_ID")
+    notion_documents_id = os.getenv("NOTION_DOCUMENTS_ID")
+    if not notion_onboarding_id or not notion_documents_id:
+        return {"processed": 0, "message": "Notion IDs not configured"}
+
+    pages = get_all_onboardings(notion_onboarding_id)
+    reminders_sent = 0
+    now = time.time()
+
+    for page in pages:
+        page_id = page.get("id")
+        if not page_id:
+            continue
+
+        props = page.get("properties", {})
+        status = get_prop_value(props, "Onboarding Status")
+        tenant_name = get_prop_value(props, "Tenant Name") or get_prop_value(props, "Tenant Name ") or "Tenant"
+        raw_phone = get_prop_value(props, "Tenant Phone")
+        property_name = (
+            get_prop_value(props, "Property Name")
+            or get_prop_value(props, "Property Nmae")
+            or get_prop_value(props, "Property/PG")
+            or "your assigned property"
+        )
+        id_str = get_prop_value(props, "Onboarding ID") or "1"
+        clean_onb_id = "".join(re.findall(r"\d+", id_str)) or id_str.replace("ONB-", "").strip()
+
+        # Only remind tenants who are In Progress or Pending Review
+        if status == "Completed":
+            if page_id in REMINDER_TRACKING:
+                del REMINDER_TRACKING[page_id]
+                save_reminder_cache(REMINDER_TRACKING)
+            continue
+
+        if not raw_phone:
+            continue
+
+        digits = "".join(re.findall(r"\d+", raw_phone))
+        if len(digits) < 10:
+            continue
+        clean_phone = f"+91{digits[-10:]}"
+
+        # Only remind tenants who were already greeted
+        if page_id not in GREETED_ONBOARDINGS:
+            continue
+
+        # Check time since last reminder (or greeting)
+        last_reminded = REMINDER_TRACKING.get(page_id, 0.0)
+        if (now - last_reminded) < REMINDER_INTERVAL_SECONDS:
+            continue
+
+        # Check tenant document progress
+        try:
+            tenant_docs = get_documents_by_onboarding(notion_documents_id, page_id)
+        except Exception as e:
+            print(f"Error checking docs for reminder: {e}")
+            continue
+
+        completed_count, progress_summary, all_completed = get_onboarding_progress(tenant_docs)
+
+        if all_completed:
+            try:
+                update_onboarding_status(page_id, "Completed")
+            except Exception:
+                pass
+            if page_id in REMINDER_TRACKING:
+                del REMINDER_TRACKING[page_id]
+                save_reminder_cache(REMINDER_TRACKING)
+            continue
+
+        # Identify which documents are still missing
+        approved_types = set()
+        for td in tenant_docs:
+            td_props = td.get("properties", {})
+            td_status = td_props.get("Validation Status", {}).get("status", {}).get("name", "")
+            td_type = td_props.get("Document Type", {}).get("select", {}).get("name", "")
+            if td_status == "Approved" and td_type:
+                norm = "PASSPORT_PHOTO" if "PASSPORT" in td_type.upper() else td_type.upper()
+                if norm == "AADHAAR":
+                    norm = "AADHAR"
+                approved_types.add(norm)
+
+        missing_list = []
+        for req_key in ["AADHAR", "PAN", "PASSPORT_PHOTO", "RENT_AGREEMENT"]:
+            if req_key not in approved_types:
+                missing_list.append(f"• {DOC_DISPLAY_NAMES.get(req_key, req_key)}")
+
+        missing_docs_str = "\n".join(missing_list)
+
+        reminder_text = (
+            f"👋 *Hi {tenant_name}!* 🏡\n\n"
+            f"Gentle follow-up regarding your onboarding for *{property_name}* *(ID: ONB-{clean_onb_id})*.\n\n"
+            f"📊 *Current Progress:* {completed_count}/4 Documents Verified\n"
+            f"⏳ *Still Needed:*\n{missing_docs_str}\n\n"
+            f"Please send a clear photo or PDF here on WhatsApp to complete your verification! ✨"
+        )
+
+        try:
+            send_whatsapp_message(to_phone=clean_phone, message_text=reminder_text)
+            REMINDER_TRACKING[page_id] = now
+            save_reminder_cache(REMINDER_TRACKING)
+            create_run_log(
+                event_type="WHATSAPP_FOLLOWUP_SENT",
+                status="SUCCESS",
+                message=f"6-Hour Follow-up sent to {tenant_name} ({clean_phone}) | Progress: {completed_count}/4",
+                onboarding_id=clean_onb_id,
+            )
+            print(f"⏰ Sent automated 6-hour follow-up to {tenant_name} ({clean_phone}) for ONB-{clean_onb_id}")
+            reminders_sent += 1
+        except Exception as e:
+            print(f"Error sending follow-up reminder to {clean_phone}: {e}")
+
+    return {"reminders_sent": reminders_sent, "status": "ok"}
+
+
 # =========================================================
 # LIFESPAN & BACKGROUND POLLING WORKERS
 # =========================================================
@@ -641,15 +788,26 @@ async def review_queue_polling_loop():
         await asyncio.sleep(5)
 
 
+async def reminder_polling_loop():
+    while True:
+        try:
+            await asyncio.to_thread(poll_and_send_pending_reminders)
+        except Exception as e:
+            print(f"Error in reminder poller: {e}")
+        await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     onboarding_task = asyncio.create_task(onboarding_polling_loop())
     review_task = asyncio.create_task(review_queue_polling_loop())
+    reminder_task = asyncio.create_task(reminder_polling_loop())
     try:
         yield
     finally:
         onboarding_task.cancel()
         review_task.cancel()
+        reminder_task.cancel()
 
 
 app = FastAPI(
