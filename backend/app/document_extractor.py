@@ -41,11 +41,19 @@ def extract_document_data(
         fields = """
 Extract exactly these fields:
 
+- is_blurry
+- blur_reason
 - name
 - pan_number
 - date_of_birth
 
 Field requirements:
+
+is_blurry:
+Set to true if the photo is out of focus, motion-blurred, blurry, has glare, or the text is illegible. Otherwise false.
+
+blur_reason:
+If is_blurry is true, provide a brief reason (e.g. "Text is blurry and out of focus"). Otherwise null.
 
 name:
 The full name printed on the PAN document.
@@ -68,6 +76,8 @@ Return null if a field cannot be confidently read.
         fields = """
 Extract exactly these fields:
 
+- is_blurry
+- blur_reason
 - name
 - aadhaar_number
 - date_of_birth
@@ -75,6 +85,12 @@ Extract exactly these fields:
 - gender
 
 Field requirements:
+
+is_blurry:
+Set to true if the photo is out of focus, motion-blurred, blurry, has glare, or the text is illegible. Otherwise false.
+
+blur_reason:
+If is_blurry is true, provide a brief reason (e.g. "Text is blurry and out of focus"). Otherwise null.
 
 name:
 The person's full name printed on the Aadhaar document.
@@ -106,6 +122,8 @@ Return null if a field cannot be confidently read.
         fields = """
 Extract exactly these fields:
 
+- is_blurry
+- blur_reason
 - tenant_name
 - landlord_name
 - property_address
@@ -115,6 +133,12 @@ Extract exactly these fields:
 - end_date
 
 Field requirements:
+
+is_blurry:
+Set to true if the document page is out of focus, motion-blurred, blurry, or illegible. Otherwise false.
+
+blur_reason:
+If is_blurry is true, provide a brief reason (e.g. "Agreement text is blurry"). Otherwise null.
 
 tenant_name:
 The full name of the tenant/renter.

@@ -55,17 +55,27 @@ def is_name_matching(extracted_name: str, expected_name: str) -> bool:
 def validate_pan(data: dict, expected_name: str | None = None) -> dict:
     errors = []
 
+    # 0. BLUR / QUALITY CHECK FIRST
+    if data.get("is_blurry") is True:
+        errors.append(data.get("blur_reason") or "Photo is blurry or out of focus. Document details cannot be verified reliably.")
+        return {
+            "valid": False,
+            "status": "MANUAL_REVIEW",
+            "errors": errors,
+            "error": " | ".join(errors),
+        }
+
     # 1. PAN NUMBER
     pan_number = str(data.get("pan_number") or "").strip().upper()
-    if not pan_number:
-        errors.append("PAN card number could not be read.")
+    if not pan_number or pan_number.lower() in {"null", "none"}:
+        errors.append("PAN card number could not be read clearly (image may be blurry or glare-affected).")
     elif not PAN_PATTERN.fullmatch(pan_number):
         errors.append("PAN card number is invalid (must be 5 letters, 4 digits, 1 letter like ABCDE1234F).")
 
     # 2. NAME ON CARD
     name = str(data.get("name") or "").strip()
-    if not name:
-        errors.append("Name is not clearly visible on the PAN card.")
+    if not name or name.lower() in {"null", "none"}:
+        errors.append("Name is not clearly visible on the PAN card (image may be blurry).")
     elif expected_name and not is_name_matching(name, expected_name):
         errors.append(
             f"Name mismatch: The PAN card belongs to '{name}', but the tenant is registered as '{expected_name}'."
@@ -73,7 +83,7 @@ def validate_pan(data: dict, expected_name: str | None = None) -> dict:
 
     # 3. DATE OF BIRTH
     date_of_birth = str(data.get("date_of_birth") or "").strip()
-    if not date_of_birth:
+    if not date_of_birth or date_of_birth.lower() in {"null", "none"}:
         errors.append("Date of birth is missing or unreadable on the PAN card.")
     elif not is_valid_date(date_of_birth):
         errors.append("Date of birth on the PAN card is not in a recognized format.")
@@ -100,19 +110,29 @@ def validate_pan(data: dict, expected_name: str | None = None) -> dict:
 def validate_aadhaar(data: dict, expected_name: str | None = None) -> dict:
     errors = []
 
+    # 0. BLUR / QUALITY CHECK FIRST
+    if data.get("is_blurry") is True:
+        errors.append(data.get("blur_reason") or "Photo is blurry or out of focus. Document details cannot be verified reliably.")
+        return {
+            "valid": False,
+            "status": "MANUAL_REVIEW",
+            "errors": errors,
+            "error": " | ".join(errors),
+        }
+
     # 1. AADHAAR NUMBER
     aadhaar_number = str(data.get("aadhaar_number") or "").strip()
     aadhaar_number = aadhaar_number.replace(" ", "").replace("-", "")
 
-    if not aadhaar_number:
-        errors.append("Aadhaar number could not be read.")
+    if not aadhaar_number or aadhaar_number.lower() in {"null", "none"}:
+        errors.append("Aadhaar number could not be read clearly (image may be blurry or cropped).")
     elif not AADHAAR_PATTERN.fullmatch(aadhaar_number):
         errors.append("Aadhaar number must contain exactly 12 numeric digits.")
 
     # 2. NAME ON CARD
     name = str(data.get("name") or "").strip()
-    if not name:
-        errors.append("Name is not clearly visible on the Aadhaar card.")
+    if not name or name.lower() in {"null", "none"}:
+        errors.append("Name is not clearly visible on the Aadhaar card (image may be blurry).")
     elif expected_name and not is_name_matching(name, expected_name):
         errors.append(
             f"Name mismatch: The Aadhaar card belongs to '{name}', but the tenant is registered as '{expected_name}'."
@@ -203,6 +223,16 @@ def validate_passport_photo(inspection: dict) -> dict:
 
 def validate_rent_agreement(data: dict, expected_name: str | None = None) -> dict:
     errors = []
+
+    # 0. BLUR / QUALITY CHECK FIRST
+    if data.get("is_blurry") is True:
+        errors.append(data.get("blur_reason") or "Agreement document is blurry or out of focus. Clauses cannot be read reliably.")
+        return {
+            "valid": False,
+            "status": "MANUAL_REVIEW",
+            "errors": errors,
+            "error": " | ".join(errors),
+        }
 
     # 1. TENANT NAME
     tenant_name = str(data.get("tenant_name") or "").strip()
