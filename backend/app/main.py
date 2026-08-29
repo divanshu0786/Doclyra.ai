@@ -8,7 +8,7 @@ import time
 from typing import Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, File, UploadFile, Request, Response, Form
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from pydantic import BaseModel
 import requests
 
@@ -1247,6 +1247,50 @@ def get_uploaded_file(filename: str):
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(file_path)
+
+
+@app.get("/", response_class=HTMLResponse)
+def root_status_page():
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Doclyra.ai | Live Backend Service</title>
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b0f19; color: #f3f4f6; margin: 0; padding: 40px 20px; display: flex; justify-content: center; align-items: center; min-height: 80vh; }
+            .card { background: #161e2e; border: 1px solid #374151; border-radius: 16px; padding: 36px; max-width: 600px; width: 100%; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5); }
+            .badge { display: inline-flex; align-items: center; gap: 8px; background: rgba(16, 185, 129, 0.1); color: #10b981; padding: 6px 14px; border-radius: 9999px; font-weight: 600; font-size: 14px; border: 1px solid rgba(16, 185, 129, 0.2); }
+            .dot { width: 8px; height: 8px; background: #10b981; border-radius: 50%; animation: pulse 2s infinite; }
+            h1 { font-size: 28px; margin: 16px 0 8px 0; color: #ffffff; }
+            p { color: #9ca3af; line-height: 1.6; font-size: 15px; margin-bottom: 24px; }
+            .btn-group { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 20px; }
+            .btn { display: inline-block; background: #2563eb; color: #ffffff; text-decoration: none; padding: 10px 20px; border-radius: 8px; font-weight: 500; font-size: 14px; transition: background 0.2s; }
+            .btn:hover { background: #1d4ed8; }
+            .btn-secondary { background: #374151; }
+            .btn-secondary:hover { background: #4b5563; }
+            .meta { margin-top: 28px; padding-top: 20px; border-top: 1px solid #374151; font-size: 13px; color: #6b7280; display: flex; justify-content: space-between; }
+            @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <div class="badge"><span class="dot"></span> Service Live & Running</div>
+            <h1>Doclyra.ai Engine</h1>
+            <p>Autonomous Tenant Document Verification & Operations Hub for Notion. Processing Aadhaar, PAN, Passport Size Photos, and Rent Agreements 24/7 via Gemini Vision AI and WhatsApp Webhooks.</p>
+            <div class="btn-group">
+                <a href="/docs" class="btn">Explore API Swagger Docs</a>
+                <a href="https://app.notion.com/p/3c70bd156bc480d9aeece27d1e59e654" target="_blank" class="btn btn-secondary">Open Notion Hub</a>
+            </div>
+            <div class="meta">
+                <span>Infrastructure: ZopDay Cloud (GCP)</span>
+                <span>Track: Notion Track</span>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
 
 
 @app.post("/whatsapp/webhook")
