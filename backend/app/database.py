@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     notion_rent_agreements_id: str | None = None
     twilio_account_sid: str | None = None
     twilio_auth_token: str | None = None
+    twilio_api_key: str | None = None
+    twilio_api_secret: str | None = None
     twilio_whatsapp_number: str | None = None
     database_url: str | None = None
 

@@ -9,9 +9,14 @@ load_dotenv()
 def get_twilio_client() -> Client:
     account_sid = os.getenv("TWILIO_ACCOUNT_SID")
     auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    api_key = os.getenv("TWILIO_API_KEY")
+    api_secret = os.getenv("TWILIO_API_SECRET")
+
+    if api_key and api_secret:
+        return Client(api_key, api_secret, account_sid=account_sid)
 
     if not account_sid or not auth_token:
-        raise ValueError("TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN must be configured in .env")
+        raise ValueError("TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN (or TWILIO_API_KEY and TWILIO_API_SECRET) must be configured in .env")
 
     return Client(account_sid, auth_token)
 

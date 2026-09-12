@@ -1524,6 +1524,11 @@ def whatsapp_webhook(
     # If media attached: Download from Twilio
     account_sid = os.getenv("TWILIO_ACCOUNT_SID")
     auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    api_key = os.getenv("TWILIO_API_KEY")
+    api_secret = os.getenv("TWILIO_API_SECRET")
+
+    auth_user = api_key or account_sid or ""
+    auth_pass = api_secret or auth_token or ""
 
     upload_dir = "uploads"
     os.makedirs(upload_dir, exist_ok=True)
@@ -1539,7 +1544,7 @@ def whatsapp_webhook(
     try:
         resp = requests.get(
             media_url,
-            auth=(account_sid or "", auth_token or ""),
+            auth=(auth_user, auth_pass),
             timeout=30,
         )
         if resp.status_code != 200:
