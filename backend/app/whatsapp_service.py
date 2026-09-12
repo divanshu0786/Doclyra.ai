@@ -1,6 +1,8 @@
 import os
+import re
 from typing import Any
 from dotenv import load_dotenv
+import requests
 from twilio.rest import Client
 
 load_dotenv()
@@ -27,8 +29,53 @@ def send_whatsapp_message(
     media_url: str | None = None,
 ) -> dict:
     """
-    Send a WhatsApp message via Twilio.
+    Send a WhatsApp message via 360dialog (if configured) or Twilio.
     """
+    d360_api_key = os.getenv("D360_API_KEY")
+    if d360_api_key:
+        d360_base_url = os.getenv("D360_BASE_URL", "https://waba-sandbox.360dialog.io/v1").rstrip("/")
+        # Format recipient: digits only, e.g. 919460895101
+        clean_digits = "".join(re.findall(r"\d+", to_phone))
+        # Ensure country code is present; if 10 digits assuming India (+91)
+        if len(clean_digits) == 10:
+            clean_digits = f"91{clean_digits}"
+
+        url = f"{d360_base_url}/messages"
+        headers = {
+            "Content-Type": "application/json",
+            "D360-API-KEY": d360_api_key,
+        }
+
+        if media_url:
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": clean_digits,
+                "type": "document",
+                "document": {
+                    "link": media_url,
+                    "caption": message_text,
+                },
+            }
+        else:
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": clean_digits,
+                "type": "text",
+                "text": {"body": message_text},
+            }
+
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            if resp.ok:
+                data = resp.json()
+                msg_id = data.get("messages", [{}])[0].get("id", "sent")
+                return {"sid": msg_id, "status": "sent", "to": clean_digits, "provider": "360dialog"}
+            else:
+                print(f"360dialog send failed ({resp.status_code}): {resp.text}")
+        except Exception as ex:
+            print(f"Error calling 360dialog API: {ex}")
+
+    # Fallback to Twilio
     client = get_twilio_client()
     from_wa = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
 
@@ -51,6 +98,7 @@ def send_whatsapp_message(
         "sid": message.sid,
         "status": str(message.status),
         "to": clean_to,
+        "provider": "twilio",
     }
 
 

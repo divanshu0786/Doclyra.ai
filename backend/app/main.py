@@ -1451,30 +1451,72 @@ def root_status_page():
     """
 
 
+@app.get("/whatsapp/webhook")
+def verify_webhook(request: Request):
+    """WhatsApp Webhook verification endpoint for Meta / 360dialog."""
+    challenge = request.query_params.get("hub.challenge")
+    if challenge:
+        return Response(content=challenge, media_type="text/plain")
+    return {"status": "webhook active"}
+
+
 @app.post("/whatsapp/webhook")
 @app.post("/")
-def whatsapp_webhook(
-    From: str = Form(""),
-    Body: str = Form(""),
-    NumMedia: str = Form("0"),
-    MediaUrl0: str | None = Form(None),
-    MediaContentType0: str | None = Form(None),
-    ProfileName: str | None = Form(None),
-):
+async def whatsapp_webhook(request: Request):
     """
-    Twilio Inbound WhatsApp Webhook.
+    Inbound WhatsApp Webhook (Supports both 360dialog and Twilio).
     Receives incoming WhatsApp messages, photos, and PDFs sent by tenants.
     Automatically classifies with Gemini, extracts, validates, updates Notion, and replies on WhatsApp.
     """
-    from_phone = From
-    clean_phone = from_phone.replace("whatsapp:", "").strip()
-    body = Body.strip()
-    num_media = int(NumMedia) if NumMedia.isdigit() else 0
-    media_url = MediaUrl0
-    media_type = MediaContentType0
-    profile_name = ProfileName or ""
+    content_type = request.headers.get("content-type", "")
+    is_d360 = "application/json" in content_type
 
-    print(f"📩 Inbound WhatsApp from {clean_phone} | Media count: {num_media} | Body: {body}")
+    if is_d360:
+        data = await request.json()
+        print(f"📩 Inbound 360dialog WhatsApp webhook payload received")
+        messages = data.get("messages", [])
+        if not messages:
+            # Acknowledgement or status update
+            return {"status": "ok"}
+        
+        msg = messages[0]
+        from_phone = msg.get("from", "")
+        clean_phone = from_phone.replace("whatsapp:", "").replace("+", "").strip()
+        msg_type = msg.get("type", "text")
+        body = ""
+        media_id = None
+        media_type = None
+        media_url = None
+
+        if msg_type == "text":
+            body = msg.get("text", {}).get("body", "").strip()
+        elif msg_type == "image":
+            img = msg.get("image", {})
+            media_id = img.get("id")
+            media_type = img.get("mime_type", "image/jpeg")
+            body = img.get("caption", "").strip()
+        elif msg_type == "document":
+            doc = msg.get("document", {})
+            media_id = doc.get("id")
+            media_type = doc.get("mime_type", "application/pdf")
+            body = doc.get("caption", "").strip()
+
+        contacts = data.get("contacts", [])
+        profile_name = contacts[0].get("profile", {}).get("name", "") if contacts else ""
+        num_media = 1 if media_id else 0
+    else:
+        form_data = await request.form()
+        from_phone = str(form_data.get("From", ""))
+        clean_phone = from_phone.replace("whatsapp:", "").strip()
+        body = str(form_data.get("Body", "")).strip()
+        num_media_str = form_data.get("NumMedia", "0")
+        num_media = int(num_media_str) if str(num_media_str).isdigit() else 0
+        media_url = form_data.get("MediaUrl0")
+        media_type = form_data.get("MediaContentType0")
+        profile_name = str(form_data.get("ProfileName", ""))
+        media_id = None
+
+    print(f"📩 Inbound WhatsApp from {clean_phone} | Media count: {num_media} | Body: {body} | Provider: {'360dialog' if is_d360 else 'Twilio'}")
 
     # Look up tenant's Onboarding in Notion using phone number
     notion_onboarding_id = os.getenv("NOTION_ONBOARDING_ID")
@@ -1512,56 +1554,71 @@ def whatsapp_webhook(
         )
 
     # If NO media attached (Text message only)
-    if num_media == 0 or not media_url:
+    has_media = bool(media_id) if is_d360 else (num_media > 0 and bool(media_url))
+    if not has_media:
         reply_text = (
             f"👋 *Hi {tenant_name}!* 🏡\n\n"
             f"Please send a clear photo or PDF of your document (*Aadhaar Card, PAN Card, Passport Photo, or Rent Agreement*) "
             f"so our AI system can automatically verify it for your onboarding *(ID: ONB-{onb_id_str})*."
         )
         send_whatsapp_message(to_phone=clean_phone, message_text=reply_text)
+        if is_d360:
+            return {"status": "ok"}
         return Response(content="<Response></Response>", media_type="application/xml")
 
-    # If media attached: Download from Twilio
-    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    api_key = os.getenv("TWILIO_API_KEY")
-    api_secret = os.getenv("TWILIO_API_SECRET")
-
-    auth_user = api_key or account_sid or ""
-    auth_pass = api_secret or auth_token or ""
-
+    # If media attached: Download from 360dialog or Twilio
     upload_dir = "uploads"
     os.makedirs(upload_dir, exist_ok=True)
     doc_num_id = int(time.time() * 1000) % 1000000
     ext = "jpg"
-    if "pdf" in str(media_type).lower():
+    if media_type and "pdf" in str(media_type).lower():
         ext = "pdf"
-    elif "png" in str(media_type).lower():
+    elif media_type and "png" in str(media_type).lower():
         ext = "png"
     storage_filename = f"onb_{onb_id_str}_{doc_num_id}_wa.{ext}"
     storage_path = os.path.join(upload_dir, storage_filename)
 
     try:
-        resp = requests.get(
-            media_url,
-            auth=(auth_user, auth_pass),
-            timeout=30,
-        )
+        if is_d360 and media_id:
+            d360_api_key = os.getenv("D360_API_KEY")
+            d360_base_url = os.getenv("D360_BASE_URL", "https://waba-sandbox.360dialog.io/v1").rstrip("/")
+            resp = requests.get(
+                f"{d360_base_url}/media/{media_id}",
+                headers={"D360-API-KEY": d360_api_key},
+                timeout=30,
+            )
+        else:
+            account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+            auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+            api_key = os.getenv("TWILIO_API_KEY")
+            api_secret = os.getenv("TWILIO_API_SECRET")
+            auth_user = api_key or account_sid or ""
+            auth_pass = api_secret or auth_token or ""
+            resp = requests.get(
+                media_url,
+                auth=(auth_user, auth_pass),
+                timeout=30,
+            )
+
         if resp.status_code != 200:
             send_whatsapp_message(
                 to_phone=clean_phone,
                 message_text="⚠️ Could not download your document from WhatsApp. Please try sending it again.",
             )
+            if is_d360:
+                return {"status": "error", "detail": "download_failed"}
             return Response(content="<Response></Response>", media_type="application/xml")
 
         with open(storage_path, "wb") as f:
             f.write(resp.content)
     except Exception as e:
-        print(f"Error downloading Twilio media: {e}")
+        print(f"Error downloading media: {e}")
         send_whatsapp_message(
             to_phone=clean_phone,
             message_text="⚠️ Error receiving your file. Please try re-uploading.",
         )
+        if is_d360:
+            return {"status": "error", "detail": str(e)}
         return Response(content="<Response></Response>", media_type="application/xml")
 
     content_type_str = media_type if media_type else ("application/pdf" if ext == "pdf" else "image/jpeg")
@@ -1766,4 +1823,6 @@ def whatsapp_webhook(
             ),
         )
 
+    if is_d360:
+        return {"status": "success"}
     return Response(content="<Response></Response>", media_type="application/xml")
