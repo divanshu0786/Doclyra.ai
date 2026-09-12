@@ -1502,16 +1502,18 @@ async def whatsapp_webhook(request: Request):
         elif msg_type == "image":
             img = msg.get("image", {})
             media_id = img.get("id")
+            media_url = img.get("url") or img.get("link")
             media_type = img.get("mime_type", "image/jpeg")
             body = img.get("caption", "").strip()
         elif msg_type == "document":
             doc = msg.get("document", {})
             media_id = doc.get("id")
+            media_url = doc.get("url") or doc.get("link")
             media_type = doc.get("mime_type", "application/pdf")
             body = doc.get("caption", "").strip()
 
         profile_name = contacts[0].get("profile", {}).get("name", "") if contacts else ""
-        num_media = 1 if media_id else 0
+        num_media = 1 if (media_id or media_url) else 0
     else:
         form_data = await request.form()
         from_phone = str(form_data.get("From", ""))
@@ -1562,7 +1564,7 @@ async def whatsapp_webhook(request: Request):
         )
 
     # If NO media attached (Text message only)
-    has_media = bool(media_id) if is_d360 else (num_media > 0 and bool(media_url))
+    has_media = bool(media_id or media_url) if is_d360 else (num_media > 0 and bool(media_url))
     if not has_media:
         reply_text = (
             f"👋 *Hi {tenant_name}!* 🏡\n\n"
@@ -1587,24 +1589,45 @@ async def whatsapp_webhook(request: Request):
     storage_path = os.path.join(upload_dir, storage_filename)
 
     try:
-        if is_d360 and media_id:
+        resp = None
+        if is_d360:
             d360_api_key = os.getenv("D360_API_KEY")
             d360_base_url = os.getenv("D360_BASE_URL", "https://waba-sandbox.360dialog.io/v1").rstrip("/")
             headers = {"D360-API-KEY": d360_api_key}
-            resp = requests.get(
-                f"{d360_base_url}/media/{media_id}",
-                headers=headers,
-                timeout=30,
-            )
-            # If 360dialog returns a JSON object containing direct media download URL
-            if resp.ok and "application/json" in resp.headers.get("content-type", ""):
-                try:
-                    media_json = resp.json()
-                    dl_url = media_json.get("url")
-                    if dl_url:
-                        resp = requests.get(dl_url, headers=headers, timeout=30)
-                except Exception as e_json:
-                    print(f"Error parsing media JSON from 360dialog: {e_json}")
+            dl_url = media_url
+
+            # Step 1: If we have media_id, fetch download URL from 360dialog
+            if media_id and not dl_url:
+                print(f"🔍 Fetching 360dialog media metadata for ID: {media_id}")
+                info_resp = requests.get(
+                    f"{d360_base_url}/media/{media_id}",
+                    headers=headers,
+                    timeout=30,
+                )
+                print(f"🔍 360dialog metadata response: status={info_resp.status_code}")
+                if info_resp.ok:
+                    if "application/json" in str(info_resp.headers.get("content-type", "")):
+                        try:
+                            media_json = info_resp.json()
+                            dl_url = media_json.get("url")
+                            print(f"🔍 Direct media URL retrieved from JSON")
+                        except Exception as e_json:
+                            print(f"Error parsing media JSON from 360dialog: {e_json}")
+                    else:
+                        resp = info_resp
+
+            # Step 2: Download the binary file from dl_url
+            if dl_url and (not resp or not resp.ok):
+                print(f"📥 Downloading media from direct URL...")
+                # Try Meta standard Authorization: Bearer header first
+                bearer_headers = {"Authorization": f"Bearer {d360_api_key}", "User-Agent": "Doclyra/1.0"}
+                resp = requests.get(dl_url, headers=bearer_headers, timeout=30)
+                if resp.status_code != 200:
+                    print(f"Bearer download status {resp.status_code}. Trying D360-API-KEY header...")
+                    resp = requests.get(dl_url, headers=headers, timeout=30)
+                if resp.status_code != 200:
+                    print(f"D360 header download status {resp.status_code}. Trying plain download...")
+                    resp = requests.get(dl_url, timeout=30)
         else:
             account_sid = os.getenv("TWILIO_ACCOUNT_SID")
             auth_token = os.getenv("TWILIO_AUTH_TOKEN")
@@ -1618,13 +1641,15 @@ async def whatsapp_webhook(request: Request):
                 timeout=30,
             )
 
-        if resp.status_code != 200:
+        if not resp or resp.status_code != 200:
+            err_code = resp.status_code if resp else "NO_RESPONSE"
+            print(f"❌ Media download failed: status={err_code}")
             send_whatsapp_message(
                 to_phone=clean_phone,
                 message_text="⚠️ Could not download your document from WhatsApp. Please try sending it again.",
             )
             if is_d360:
-                return {"status": "error", "detail": "download_failed"}
+                return {"status": "error", "detail": f"download_failed_{err_code}"}
             return Response(content="<Response></Response>", media_type="application/xml")
 
         with open(storage_path, "wb") as f:
