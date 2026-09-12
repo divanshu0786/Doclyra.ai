@@ -1473,8 +1473,17 @@ async def whatsapp_webhook(request: Request):
 
     if is_d360:
         data = await request.json()
-        print(f"📩 Inbound 360dialog WhatsApp webhook payload received")
-        messages = data.get("messages", [])
+        print(f"📩 Inbound 360dialog WhatsApp webhook payload received: {json.dumps(data)[:250]}")
+        messages = data.get("messages")
+        contacts = data.get("contacts")
+        if not messages:
+            entry = data.get("entry", [{}])[0]
+            changes = entry.get("changes", [{}])[0]
+            value = changes.get("value", {})
+            messages = value.get("messages", [])
+            if not contacts:
+                contacts = value.get("contacts", [])
+
         if not messages:
             # Acknowledgement or status update
             return {"status": "ok"}
@@ -1501,7 +1510,6 @@ async def whatsapp_webhook(request: Request):
             media_type = doc.get("mime_type", "application/pdf")
             body = doc.get("caption", "").strip()
 
-        contacts = data.get("contacts", [])
         profile_name = contacts[0].get("profile", {}).get("name", "") if contacts else ""
         num_media = 1 if media_id else 0
     else:
@@ -1582,11 +1590,21 @@ async def whatsapp_webhook(request: Request):
         if is_d360 and media_id:
             d360_api_key = os.getenv("D360_API_KEY")
             d360_base_url = os.getenv("D360_BASE_URL", "https://waba-sandbox.360dialog.io/v1").rstrip("/")
+            headers = {"D360-API-KEY": d360_api_key}
             resp = requests.get(
                 f"{d360_base_url}/media/{media_id}",
-                headers={"D360-API-KEY": d360_api_key},
+                headers=headers,
                 timeout=30,
             )
+            # If 360dialog returns a JSON object containing direct media download URL
+            if resp.ok and "application/json" in resp.headers.get("content-type", ""):
+                try:
+                    media_json = resp.json()
+                    dl_url = media_json.get("url")
+                    if dl_url:
+                        resp = requests.get(dl_url, headers=headers, timeout=30)
+                except Exception as e_json:
+                    print(f"Error parsing media JSON from 360dialog: {e_json}")
         else:
             account_sid = os.getenv("TWILIO_ACCOUNT_SID")
             auth_token = os.getenv("TWILIO_AUTH_TOKEN")
